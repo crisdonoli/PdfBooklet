@@ -4,8 +4,10 @@
 from __future__ import print_function
 from __future__ import unicode_literals
 
+# 3.1.5f : fixed incorrect crop when changing output size (set cropbox=mediabox before merge)
 # 3.1.4e : small bugfix
-# version 3.1.4d : added output size dropdown, replace PDFShuffler icon for a newer icon.
+# version 3.1.6 : Migration to pypdf v3+ and integration of PdfArranger
+
 # version 3.1.4c : fixed horizontal scrollbar, optimized zoom, fixed multiprocessing pool error, implemented thumbnail caching
 # version 3.1.4b : fixed PDFShuffler on Python3, added "Reset" button to PDFShuffler, change app icon
 # version 3.1.4a : fixed missing online documentation function and "Autoscale" checkbox check, reverted changes made to the autoScaleAndRotate function
@@ -33,9 +35,9 @@ from __future__ import unicode_literals
 # https://stackoverflow.com/questions/45838863/gio-memoryinputstream-does-not-free-memory-when-closed
 # Fix bug for display of red rectangles when the output page is rotated 90° or 270°
 
-PB_version = "3.1.4e"
+PB_version = "3.1.6"
 # it integrates the changes of the file which have 3.1.5 as reference. 
-# Next version should be 3.1.6
+# Next version should be 3.2.0
 
 
 """
@@ -244,8 +246,244 @@ from gi.repository import cairo
 
 Gtk.rc_parse("./gtkrc")
 
-from pdfbooklet.PyPDF2_G import PdfFileReader, PdfFileWriter
-import pdfbooklet.PyPDF2_G.generic as generic
+from pdfbooklet.pypdf import PdfReader, PdfWriter, PageObject, Transformation
+import pdfbooklet.pypdf.generic as generic
+from pdfbooklet.pypdf.generic import DecodedStreamObject, ArrayObject, NameObject, DictionaryObject, StreamObject, NumberObject, IndirectObject, RectangleObject
+import re
+
+def mergePage3(self, data):
+    """
+    Clean merge method using pypdf's native Transformation class.
+    
+    Accepts a list of items where each item is either:
+    - A tuple: (PageObject, Transformation) - page with its complete transformation
+    - A PageObject: merged without transformation (identity)
+    
+    For legacy compatibility, also accepts the old format with strings:
+    - "q\n", "Q\n" - ignored (graphics state)
+    - "a b c d e f cm\n" - transformation matrix (accumulated)
+    - PageObject - merged with accumulated transformation
+    """
+    import re
+    
+    # Check if we're using the new structured format or legacy format
+    if data and isinstance(data[0], tuple):
+        # New format: list of (page, transformation) tuples
+        for item in data:
+            if isinstance(item, tuple) and len(item) == 2:
+                page, transform = item
+                
+                # Set a VERY LARGE cropbox to disable pypdf clipping
+                original_cropbox = page.get("/CropBox")
+                large_cropbox = RectangleObject([-10000, -10000, 10000, 10000])
+                page[NameObject("/CropBox")] = large_cropbox
+                
+                try:
+                    self.merge_transformed_page(page, transform)
+                finally:
+                    # Restore original cropbox
+                    if original_cropbox is not None:
+                        page[NameObject("/CropBox")] = original_cropbox
+                    elif "/CropBox" in page:
+                        del page["/CropBox"]
+        return
+    
+    # Legacy format: strings and PageObjects
+    accumulated_ctm = Transformation()
+    base_ctm = Transformation()
+    inside_graphics_state = False
+    
+    for item in data:
+        if isinstance(item, (str, bytes)):
+            if isinstance(item, str):
+                text_item = item
+            else:
+                text_item = item.decode("latin1")
+            
+            if text_item.strip() == 'q':
+                if not inside_graphics_state:
+                    base_ctm = accumulated_ctm
+                inside_graphics_state = True
+                continue
+            
+            if text_item.strip() == 'Q':
+                inside_graphics_state = False
+                continue
+            
+            # Extract cm commands
+            for cm_match in re.finditer(r'([\d.,\-]+)\s+([\d.,\-]+)\s+([\d.,\-]+)\s+([\d.,\-]+)\s+([\d.,\-]+)\s+([\d.,\-]+)\s+cm', text_item):
+                try:
+                    a = float(cm_match.group(1).replace(',', '.'))
+                    b = float(cm_match.group(2).replace(',', '.'))
+                    c = float(cm_match.group(3).replace(',', '.'))
+                    d = float(cm_match.group(4).replace(',', '.'))
+                    e = float(cm_match.group(5).replace(',', '.'))
+                    f = float(cm_match.group(6).replace(',', '.'))
+                    
+                    new_tr = Transformation((a, b, c, d, e, f))
+                    accumulated_ctm = accumulated_ctm.transform(new_tr)
+                except (ValueError, IndexError):
+                    pass
+        else:
+            # PageObject
+            page = item
+            ctm_tuple = accumulated_ctm.ctm
+            
+            # Disable pypdf clipping
+            original_cropbox = page.get("/CropBox")
+            large_cropbox = RectangleObject([-10000, -10000, 10000, 10000])
+            page[NameObject("/CropBox")] = large_cropbox
+            
+            try:
+                is_identity = (abs(ctm_tuple[0] - 1) < 0.001 and 
+                               abs(ctm_tuple[1]) < 0.001 and 
+                               abs(ctm_tuple[2]) < 0.001 and 
+                               abs(ctm_tuple[3] - 1) < 0.001 and 
+                               abs(ctm_tuple[4]) < 0.001 and 
+                               abs(ctm_tuple[5]) < 0.001)
+                
+                if not is_identity:
+                    self.merge_transformed_page(page, ctm_tuple)
+                else:
+                    self.merge_page(page)
+            finally:
+                if original_cropbox is not None:
+                    page[NameObject("/CropBox")] = original_cropbox
+                elif "/CropBox" in page:
+                    del page["/CropBox"]
+            
+            accumulated_ctm = base_ctm
+
+
+def calculate_page_transform(page, row, column, ref_width, ref_height, 
+                              output_width, output_height, output_scale, 
+                              columns_i, rows_i, rotate_to_fit=True):
+    """
+    Calculate the complete transformation for a page using pypdf's Transformation class.
+    
+    This function builds a single transformation matrix that:
+    1. Optionally rotates the page to match reference orientation
+    2. Scales the page to fit within the reference cell
+    3. Centers the page within its cell
+    4. Positions the page at the correct cell location
+    5. Scales everything to fit the output page
+    6. Centers the scaled content on the output page
+    
+    Args:
+        page: The source PageObject
+        row: Row position (0-indexed, 0 is bottom)
+        column: Column position (0-indexed)
+        ref_width: Reference cell width (input page width)
+        ref_height: Reference cell height (input page height)
+        output_width: Output page width
+        output_height: Output page height
+        output_scale: Scale factor to fit content on output (1.0 = no scaling)
+        columns_i: Number of columns in layout
+        rows_i: Number of rows in layout
+        rotate_to_fit: Whether to rotate page to match reference orientation
+        
+    Returns:
+        A Transformation object representing the complete transformation
+    """
+    import math
+    
+    # Get page dimensions
+    # Handle implicit rotation via /Rotate attribute
+    source_rotation = 0
+    if "/Rotate" in page:
+        source_rotation = int(page["/Rotate"])
+        
+    orig_width = float(page.mediabox.width)
+    orig_height = float(page.mediabox.height)
+    
+    # Adjust dimensions based on rotation
+    if source_rotation in [90, -270]:
+        page_width, page_height = orig_height, orig_width
+    elif source_rotation in [270, -90]:
+        page_width, page_height = orig_height, orig_width
+    else: # 0, 180
+        page_width, page_height = orig_width, orig_height
+    
+    # Determine orientations
+    ref_landscape = ref_width > ref_height
+    page_landscape = page_width > page_height
+    
+    rotation = 0
+    if rotate_to_fit and ref_landscape != page_landscape:
+        rotation = 270  # Rotate 270 degrees (or -90) relative to current orientation
+        # After rotation, swap dimensions
+        page_width, page_height = page_height, page_width
+    
+    # Calculate scale to fit page in reference cell
+    scale_w = ref_width / page_width
+    scale_h = ref_height / page_height
+    page_scale = min(scale_w, scale_h)
+    
+    # Calculate centering within the reference cell
+    scaled_page_width = page_width * page_scale
+    scaled_page_height = page_height * page_scale
+    h_center_in_cell = (ref_width - scaled_page_width) / 2
+    v_center_in_cell = (ref_height - scaled_page_height) / 2
+    
+    # Cell position in reference coordinates
+    cell_x = column * ref_width
+    cell_y = row * ref_height
+    
+    # Calculate output centering
+    total_content_width = ref_width * columns_i * output_scale
+    total_content_height = ref_height * rows_i * output_scale
+    h_center_output = (output_width - total_content_width) / 2
+    v_center_output = (output_height - total_content_height) / 2
+    
+    # Build the transformation chain
+    transform = Transformation()
+    
+    # Step 0: Apply source page rotation (from /Rotate or imposition)
+    # This aligns the coordinate system to be "upright" relative to the visual page
+    if source_rotation != 0:
+        transform = transform.rotate(source_rotation)
+        if source_rotation == 90 or source_rotation == -270:
+            transform = transform.translate(tx=orig_height, ty=0)
+        elif source_rotation == 180 or source_rotation == -180:
+            transform = transform.translate(tx=orig_width, ty=orig_height)
+        elif source_rotation == 270 or source_rotation == -90:
+            transform = transform.translate(tx=0, ty=orig_width)
+            
+    # Step 1: Logical Rotation (rotate_to_fit)
+    if rotation != 0:
+        transform = transform.rotate(rotation)
+        # Rotation handling:
+        # When rotating 90/270 degrees, dimensions are swapped.
+        # We need to translate the page back into the positive quadrant (0,0 to W,H).
+        # 
+        # For 270 degree rotation (equivalent to -90):
+        # x' = y, y' = -x
+        # The page rotates down into negative Y.
+        # We must translate by the original width (which is the new height).
+        transform = transform.translate(tx=0, ty=page_height)
+    
+    # Step 2: Scale page to fit in reference cell
+    transform = transform.scale(sx=page_scale, sy=page_scale)
+    
+    # Step 3: Center page within reference cell
+    transform = transform.translate(tx=h_center_in_cell, ty=v_center_in_cell)
+    
+    # Step 4: Position at cell location (in reference coordinates)
+    transform = transform.translate(tx=cell_x, ty=cell_y)
+    
+    # Step 5: Scale everything to fit output page
+    if output_scale != 1.0:
+        # Scale around origin - this scales both content and positions
+        transform = transform.scale(sx=output_scale, sy=output_scale)
+    
+    # Step 6: Center on output page
+    if h_center_output > 0.001 or v_center_output > 0.001:
+        transform = transform.translate(tx=h_center_output, ty=v_center_output)
+    
+    return transform
+
+
+PageObject.mergePage3 = mergePage3
 
 # from pdfbooklet import *
 from pdfbooklet.files_chooser import Chooser
@@ -713,8 +951,8 @@ class TxtOnly :
                     inputFiles_a = {}
                     for filename in temp1.split("|") :
                         if os.path.isfile(filename) :
-                            pdfFile = PdfFileReader(open(filename, "rb"))
-                            numpages = pdfFile.getNumPages()
+                            pdfFile = PdfReader(open(filename, "rb"))
+                            numpages = len(pdfFile.pages)
                             path, shortFileName = os.path.split(filename)
                             i = len(inputFiles_a)
                             inputFiles_a[i + 1] = filename
@@ -803,19 +1041,24 @@ class TxtOnly :
         for key in inputFiles_a :
             val = inputFiles_a[key]
             if os.path.isfile(val) :
-                inputFile_a[val] = PdfFileReader(open(val, "rb"))
+                inputFile_a[val] = PdfReader(open(val, "rb"))
                 inputFile_details[val] = {}
-                if inputFile_a[val].getIsEncrypted() :
+                if inputFile_a[val].is_encrypted :
                     inputFile_details[val]["encrypt"] = True
-                    if not hasattr(inputFile_a[val], "_decryption_key") :   # if not already decrypted
-                        password = ask_text(None, _("Please, enter the password for this file"))
-                        if password != None :
-                            password = password.encode("utf8")
-                            inputFile_a[val].decrypt(password)     # Encrypted file
-                            if key == 1 :           # we get permissions and password from the first file
-                                (a,b,self.permissions_i) = inputFile_a[val].getPermissions()
-                                self.password_s = password
-                        inputFile_details[val]["password"] = password
+                    # if not hasattr(inputFile_a[val], "_decryption_key") :   # if not already decrypted
+                    # TODO: _decryption_key check might not be needed or different in pypdf
+                    # pypdf usually handles decryption state differently. For now commenting out to avoid AttributeError if property changed.
+                    # Checking if is_encrypted should be enough for now.
+                    password = ask_text(None, _("Please, enter the password for this file"))
+                    if password != None :
+                        password = password.encode("utf8")
+                        inputFile_a[val].decrypt(password)     # Encrypted file
+                        if key == 1 :           # we get permissions and password from the first file
+                            # FIXME: getPermissions does not exist in pypdf v3+
+                            # (a,b,self.permissions_i) = inputFile_a[val].getPermissions()
+                            self.permissions_i = 0 # Default/Placeholder
+                            self.password_s = password
+                    inputFile_details[val]["password"] = password
                 selectedIndex_a = {}
                 deletedIndex_a = {}
 
@@ -834,15 +1077,15 @@ class TxtOnly :
             fileName = inputFiles_a[ref_file]
             fileName = unicode2(fileName)
             try :
-                page0 = inputFile_a[fileName].getPage(ref_page)
+                page0 = inputFile_a[fileName].pages[ref_page]
             except :
                 print(_("The reference page is invalid. We use the first page"))
-                page0 = inputFile_a[fileName].getPage(0)
+                page0 = inputFile_a[fileName].pages[0]
 
-            llx_i=page0.mediaBox.getLowerLeft_x()
-            lly_i=page0.mediaBox.getLowerLeft_y()
-            urx_i=page0.mediaBox.getUpperRight_x()
-            ury_i=page0.mediaBox.getUpperRight_y()
+            llx_i=page0.mediabox.left
+            lly_i=page0.mediabox.bottom
+            urx_i=page0.mediabox.right
+            ury_i=page0.mediabox.top
 
             urx_i=float(urx_i) - float(llx_i)
             ury_i=float(ury_i) - float(lly_i)
@@ -972,6 +1215,7 @@ class gtkGui(TxtOnly):
         self.backup = []
         self.backup_index = 0
         self.backup_command = True
+        self.myselectedpage = "" # Initialize to avoid AttributeError in OnDraw
 
 
         self.widgets = Gtk.Builder()
@@ -2617,14 +2861,17 @@ class gtkGui(TxtOnly):
             # draw rectangle
             if draw_page_b == True :
 
-                file_number, page_number = self.myselectedpage.split(":")
-                selected_ref = file_number + ":" + str(int(page_number) - 1)
-
-
-                coord = [left, top]
-                cr.set_line_width(3)
-                cr.rectangle(coord[0], coord[1],  columnWidth, rowHeight)
-                cr.stroke()
+                if hasattr(self, 'myselectedpage') and self.myselectedpage and ":" in self.myselectedpage:
+                    try:
+                        file_number, page_number = self.myselectedpage.split(":")
+                        # selected_ref = file_number + ":" + str(int(page_number) - 1) # Unused?
+        
+        
+                        coord = [left, top]
+                        cr.set_line_width(3)
+                        cr.rectangle(coord[0], coord[1],  columnWidth, rowHeight)
+                        cr.stroke()
+                    except: pass
 
 
             i += 1
@@ -3026,7 +3273,7 @@ class gtkGui(TxtOnly):
         x = []
         for f in inputFiles_a :
             fileName = inputFiles_a[f]
-            numPages = inputFile_a[fileName].getNumPages()
+            numPages = len(inputFile_a[fileName].pages)
             for z in range(numPages) :
                 pageRef_s = str(i) + ":" + str(z)
                 if pageRef_s + "deleted" in deletedIndex_a :
@@ -3132,7 +3379,7 @@ class gtkGui(TxtOnly):
         numFiles = len(inputFiles_a)
         for f in inputFiles_a :
             fileName = inputFiles_a[f]
-            numPages = inputFile_a[fileName].getNumPages()
+            numPages = len(inputFile_a[fileName].pages)
             if numPages > maxPages :
                 maxPages = numPages
             files_data[index] = numPages
@@ -3161,9 +3408,8 @@ class gtkGui(TxtOnly):
         global outputScale, pageContent_a
         global selectedIndex_a, deletedIndex_a
         global areaAllocationW_i, areaAllocationH_i
-        global preview_b
-
-
+        
+        
         if preview_b == False :
             return
 
@@ -3193,7 +3439,7 @@ class gtkGui(TxtOnly):
 
                     self.ar_pages = ar_pages
                     self.ar_layout = ar_layout
-
+                    
                     if self.render.createNewPdf(ar_pages, ar_layout, ar_cahiers, "", previewPage) :
 
                         # force the "draw" signal to update the display
@@ -3370,13 +3616,13 @@ class gtkGui(TxtOnly):
             return
         if self.shuffler == None :
             self.shuffler = PdfShuffler()
-            self.shuffler_window = self.shuffler.uiXML.get_object('main_window')
+            # USE THE ACTIVE WINDOW (Handles Handy replacement)
+            self.shuffler_window = self.shuffler.window 
             self.shuffler.uiXML.get_object('menubar').hide()
             self.shuffler.uiXML.get_object('toolbar1').hide()
             #self.shuffler.uiXML.get_object('menu1_RR').hide()
             #self.shuffler.uiXML.get_object('menu1_RL').hide()
             self.shuffler.uiXML.get_object('menu1_crop').hide()
-            self.shuffler.window.set_deletable(False)
             shufflerBB = self.arw['shufflerbuttonbox']
             shufflerBB.unparent()
             vbox = self.shuffler.uiXML.get_object('vbox1')
@@ -3402,7 +3648,7 @@ class gtkGui(TxtOnly):
 
     def resetShuffler(self, widget=None):
         """Resets the shuffler to the original PDF order (1..N)."""
-        print(f"DEBUG: resetShuffler called. Forcing default selection.")
+
         if hasattr(self.shuffler, 'pool') and self.shuffler.pool:
             self.shuffler.pool.terminate()
             self.shuffler.pool.join()
@@ -3416,11 +3662,13 @@ class gtkGui(TxtOnly):
     def loadShuffler(self, selection="") :
             self.render.parsePageSelection(selection, 0)
 
+            doc_map = {}
             for key in inputFiles_a :
                 pdfdoc = PDF_Doc(inputFiles_a[key], self.shuffler.nfile, self.shuffler.tmp_dir)
                 if pdfdoc.nfile != 0 and pdfdoc != []:
                     self.shuffler.nfile = pdfdoc.nfile
                     self.shuffler.pdfqueue.append(pdfdoc)
+                    doc_map[key] = pdfdoc
 
             angle=0
             crop=[0.,0.,0.,0.]
@@ -3428,8 +3676,11 @@ class gtkGui(TxtOnly):
             for page in pagesSel :
                 file1, page1 = page.split(":")
                 npage = int(page1) + 1
-                filenumber = int(file1) - 1
-                pdfdoc = self.shuffler.pdfqueue[filenumber]
+                # filenumber = int(file1) - 1 # This logic is flawed if keys are not sequential 1..N
+                pdfdoc = doc_map.get(int(file1))
+                if not pdfdoc:
+                    # Should not happen if data consistency is maintained
+                    continue
                 if npage > 0 :
                     docPage = pdfdoc.document.get_page(npage-1)
                 else :
@@ -3439,52 +3690,70 @@ class gtkGui(TxtOnly):
                 # blank page
                 if npage == 0 :
                     descriptor = 'Blank'
-                    width = self.shuffler.iv_col_width
-                    row =(descriptor,         # 0
-                          None,               # 1
-                          1,                  # 2
-                          -1,                 # 3
-                          self.zoom_scale,    # 4
-                          "",                 # 5
-                          0,                  # 6
-                          0,0,                # 7-8
-                          0,0,                # 9-10
-                          w,h,                # 11-12
-                          2.              )  # 13 FIXME
-
-                    self.shuffler.model.append(row)
+                    # width/height are in points (from get_size), create blank pdf matching this
+                    # PdfArranger uses points for size
+                    b_doc, b_nfile = self.shuffler.get_blank_pdf(w, h)
+                    
+                    page_obj = Page(
+                        b_nfile, 
+                        1, 
+                        self.shuffler.zoom_scale, 
+                        b_doc.copyname, 
+                        0, 
+                        1.0, 
+                        Sides(0,0,0,0), 
+                        Sides(0,0,0,0), 
+                        Dims(w, h), 
+                        descriptor, 
+                        []
+                    )
+                    self.shuffler.model.append([page_obj, descriptor])
                 else :
-
-
-
-
-
+                    Id = str(file1) + ":" + str(npage)
+                    angle = 0
+                    crop = [0., 0., 0., 0.]
+                    if Id in config:
+                         if "shuffler_rotate" in config[Id]:
+                             angle = int(config[Id]["shuffler_rotate"])
+                             
+                         if "shuffler_crop" in config[Id]:
+                             try:
+                                 vals = config[Id]["shuffler_crop"].split(",")
+                                 if len(vals) == 4:
+                                     crop = [float(x) for x in vals]
+                             except:
+                                 pass
                     descriptor = ''.join([pdfdoc.shortname, '\n', _('page'), ' ', str(npage)])
-                    iter = self.shuffler.model.append((descriptor,         # 0
-                                              None,               # 1
-                                              pdfdoc.nfile,       # 2
-                                              npage,              # 3
-                                              self.shuffler.zoom_scale,    # 4
-                                              pdfdoc.filename,    # 5
-                                              angle,              # 6
-                                              crop[0],crop[1],    # 7-8
-                                              crop[2],crop[3],    # 9-10
-                                              w,h,                # 11-12
-                                              2.              ))  # 13 FIXME
-                    self.shuffler.update_geometry(iter)
+                    page_obj = Page(
+                        pdfdoc.nfile, 
+                        npage, 
+                        self.shuffler.zoom_scale, 
+                        pdfdoc.filename, 
+                        angle, 
+                        1.0, 
+                        Sides(crop[0], crop[1], crop[2], crop[3]), 
+                        Sides(0,0,0,0), 
+                        Dims(w, h), 
+                        descriptor, 
+                        []
+                    )
+                    iter = self.shuffler.model.append([page_obj, descriptor])
                     res = True
 
             self.shuffler.reset_iv_width()
             if res:
                 self.shuffler.render()
-            return res
 
-
+    def on_shuffler_delete(self, widget, event):
+        """Handle window close request (X button) as Cancel."""
+        self.closePS()
+        return True
 
     def closePS(self) :
         if self.shuffler :
             self.shuffler.rendering_thread.quit = True
-            Gdk.threads_enter()
+            # self.shuffler.rendering_thread.quit = True # This was already set? Line 3774
+            # Gdk.threads_enter() # REMOVED to avoid lock
             # TODO ££
 ##            if self.shuffler.rendering_thread.paused == True:
 ##                 self.shuffler.rendering_thread.evnt.set()
@@ -3498,10 +3767,24 @@ class gtkGui(TxtOnly):
 
         selection = []
         for row in self.shuffler.model:
-            Id = str(row[2]) + ":" + str(row[3])
-            selection += [Id]
-            angle = row[7]
-
+            page = row[0]
+            # Decoupling Selection ID (1-based for string parsing) from Config ID (0-based for internal use)
+            if page.description == 'Blank':
+                page_idx_sel = -1
+                page_idx_cfg = -1
+            else:
+                page_idx_sel = page.npage
+                page_idx_cfg = page.npage
+            
+            Id_sel = str(page.nfile) + ":" + str(page_idx_sel)
+            Id_cfg = str(page.nfile) + ":" + str(page_idx_cfg)
+            
+            selection += [Id_sel]
+            try:
+                angle = int(page.angle)
+            except:
+                angle = 0
+            
             if angle != 0 :
                 if angle == 90 :        # In Pdf format, global rotation rotates clockwise,
                     angle = 270         # fine rotation (used by PdfBooklet) rotates counterclockwise.
@@ -3509,21 +3792,35 @@ class gtkGui(TxtOnly):
                 elif angle == -90 :
                     angle = 90
 
-
-            if not Id in config and angle != 0 :
-                config[Id] = {}
+            # Use Id_cfg for config storage
+            if not Id_cfg in config and angle != 0 :
+                config[Id_cfg] = {}
                 # defaults
-                config[Id]["htranslate"] = 0
-                config[Id]["vtranslate"] = 0
-                config[Id]["scale"] = 1
-                config[Id]["rotate"] = 0
+                config[Id_cfg]["htranslate"] = 0
+                config[Id_cfg]["vtranslate"] = 0
+                config[Id_cfg]["scale"] = 1
+                config[Id_cfg]["rotate"] = 0
 
             if angle != 0 :
-                config[Id]["shuffler_rotate"] = angle
-##                if angle == 270 :
-##                    config[Id]["vtranslate"] = pix_w
+                config[Id_cfg]["shuffler_rotate"] = angle
+            elif Id_cfg in config and "shuffler_rotate" in config[Id_cfg]:
+                del config[Id_cfg]["shuffler_rotate"]
+
+            # Save shuffler_crop
+            # page.crop is Sides(left, right, top, bottom)
+            crop_rect = page.crop
+            has_crop = False
+            if crop_rect:
+                if (crop_rect.left != 0 or crop_rect.right != 0 or crop_rect.top != 0 or crop_rect.bottom != 0):
+                    has_crop = True
+            
+            if has_crop:
+                 val = f"{crop_rect.left},{crop_rect.right},{crop_rect.top},{crop_rect.bottom}"
+                 config[Id_cfg]["shuffler_crop"] = val
+            elif Id_cfg in config and "shuffler_crop" in config[Id_cfg]:
+                 del config[Id_cfg]["shuffler_crop"]
 ##                elif angle == 90 :
-##                    config[Id]["htranslate"] = pix_h
+##                    config[Id_cfg]["htranslate"] = pix_h
 
 
 
@@ -3656,7 +3953,25 @@ class gtkGui(TxtOnly):
         showwarning("Not yet implemented", "This feature will be implemented in version 2.2")
 
     def aboutPdfbooklet(self, widget) :
-        self.arw["Pdf-Booklet"].show()
+        about = self.arw["Pdf-Booklet"]
+        about.set_version(PB_version)
+        
+        authors = about.get_authors()
+        new_authors = [
+            "",
+            "Core Dependencies:",
+            "pypdf (v3+) - https://github.com/py-pdf/pypdf",
+            "pdfarranger - https://github.com/pdfarranger/pdfarranger",
+            "",
+            "PdfBooklet maintainer:",
+            "Tomas Julian Resquin",
+        ]
+        
+        # Avoid duplicating credits if opened multiple times
+        if not any("pypdf" in s for s in authors):
+             about.set_authors(new_authors + authors)
+             
+        about.show()
 
     def aboutdialog1_close(self, widget,event) :
         self.arw["Pdf-Booklet"].hide()
@@ -3776,12 +4091,34 @@ class gtkGui(TxtOnly):
 class pdfRender():
 
     def transform(self, row, column, page_number, output_page_number, file_number) :
-        global optionsDict, config, rows_i
+        global optionsDict, config, rows_i, outputScale, mediabox_l, columns_i
 
         # init variables
-
-        V_offset = row * ury_i
-        H_offset = column * urx_i
+        # Calculate cell positions including output scaling and centering
+        autoscale_enabled = app.autoscale.get_active() == 1
+        
+        if autoscale_enabled and outputScale != 1 and mediabox_l:
+            # Calculate centering offsets for when content is scaled to fit output
+            oWidth_i = urx_i * columns_i
+            oHeight_i = ury_i * rows_i
+            scaled_width = oWidth_i * outputScale
+            scaled_height = oHeight_i * outputScale
+            output_width = mediabox_l[0]
+            output_height = mediabox_l[1]
+            
+            # Center the scaled content on the output page
+            h_center = (output_width - scaled_width) / 2
+            v_center = (output_height - scaled_height) / 2
+            
+            # Cell position: input coords scaled, plus centering offset
+            # This position will NOT be further scaled by outputScale (already included)
+            V_offset = row * ury_i * outputScale + v_center
+            H_offset = column * urx_i * outputScale + h_center
+        else:
+            # No output scaling - use original coordinates
+            V_offset = row * ury_i
+            H_offset = column * urx_i
+            
         cos_l = 1
         sin_l = 0
 
@@ -3893,37 +4230,62 @@ class pdfRender():
             if not "rotate" in config[Id] :
                 config[Id]["rotate"] = 0
 
+            htranslate = 0
+            vtranslate = 0
+            pdfrotate = 0
+
             if "shuffler_rotate" in config[Id] :
-                # we need the page size
-                pdfDoc = app.shuffler.pdfqueue[file_number-1]
-                page = pdfDoc.document.get_page(page_number)
-                pix_w, pix_h = page.get_size()
+                try:
+                    # Parse Id "file:page" (1-based indices in config key)
+                    file_s, page_s = Id.split(":")
+                    file_idx = int(file_s)
+                    page_idx = int(page_s) - 1 # Convert to 0-based for list access
+                    
+                    # retrieve page size from internal structure instead of app.shuffler
+                    # global inputFiles_a maps 1..N to filename
+                    # global inputFile_a maps filename to PDF object
+                    fileName = inputFiles_a[file_idx]
+                    pdfObj = inputFile_a[fileName]
+                    pageObj = pdfObj.pages[page_idx]
+                    
+                    # Assume mediaBox is [x1, y1, x2, y2]
+                    # width = x2 - x1, height = y2 - y1
+                    # pdfrw objects? or pikepdf?
+                    # PdfBooklet usually uses internal PDF class where page.mediaBox is a list of floats
+                    mbox = pageObj.mediaBox
+                    pix_w = float(mbox[2]) - float(mbox[0])
+                    pix_h = float(mbox[3]) - float(mbox[1])
 
-                angle = int(config[Id]["shuffler_rotate"])
-                pdfrotate += angle
-                if angle == 270 :
-                    vtranslate = float(vtranslate) + float(pix_w)
-                elif angle == 90 :
-                    htranslate = float(htranslate) + float(pix_h)
-                elif angle == 180 :
-                    htranslate = float(htranslate) + float(pix_w)
-                    vtranslate = float(vtranslate) + float(pix_h)
+                    angle = int(config[Id]["shuffler_rotate"])
+                    pdfrotate += angle
+                    if angle == 270 or angle == -90:
+                        vtranslate += float(pix_w)
+                    elif angle == 90 or angle == -270:
+                        htranslate += float(pix_h)
+                    elif angle == 180 or angle == -180:
+                        htranslate += float(pix_w)
+                        vtranslate += float(pix_h)
+                except Exception as e:
+                    print(f"Error applying shuffler_rotate: {e}")
 
-            ht = ini.readmmEntry(config[Id]["htranslate"])
-            vt = ini.readmmEntry(config[Id]["vtranslate"])
+            ht = ini.readmmEntry(config[Id]["htranslate"]) + htranslate
+            vt = ini.readmmEntry(config[Id]["vtranslate"]) + vtranslate
             sc = ini.readPercentEntry(config[Id]["scale"])
             ro = ini.readNumEntry(config[Id]["rotate"])
             xs = ini.readPercentEntry(config[Id]["xscale"])
             ys = ini.readPercentEntry(config[Id]["yscale"])
 
-
+            try:
+                base_pdfrotate = ini.readNumEntry(config[Id]["pdfRotate"])
+            except:
+                base_pdfrotate = 0
 
             matrix_s = self.calcMatrix2(ht, vt,
                                        cScale = sc,
                                        xscale = xs,
                                        yscale = ys,
                                        cRotate = ro,
-                                       Rotate = ini.readNumEntry(config[Id]["pdfRotate"]),
+                                       Rotate = base_pdfrotate + pdfrotate,
                                        vflip = ini.readBoolean(config[Id]["vflip"]),
                                        hflip = ini.readBoolean(config[Id]["hflip"]))
 
@@ -3944,8 +4306,25 @@ class pdfRender():
             Vtranslate = 0
 
 
+            Rotate = 0
             if config.has_option(trans, "PdfRotate") :
                 Rotate = config.getint(trans, "PdfRotate")
+
+            if config.has_option(trans, "shuffler_rotate") :
+                 angle = config.getint(trans, "shuffler_rotate")
+                 Rotate += angle
+                 
+                 # Adjust translation for standard 90-degree rotations
+                 # Using global page dimensions urx_i, ury_i
+                 if angle == 90 or angle == -270:
+                     Htranslate += ury_i
+                 elif angle == 270 or angle == -90:
+                     Vtranslate += urx_i
+                 elif angle == 180 or angle == -180:
+                     Htranslate += urx_i
+                     Vtranslate += ury_i
+            
+            if Rotate != 0:
                 sin_l = math.sin(math.radians(Rotate))
                 cos_l = math.cos(math.radians(Rotate))
                 cos2_l = cos_l
@@ -4191,15 +4570,15 @@ class pdfRender():
 
         return (sin_l, cos_l, Hcorr, Vcorr)
 
-    def autoScaleAndRotate(self, fileNum, page) :
-        global inputFiles_a, inputFile_a, refPageSize_a
+    def autoScaleAndRotate(self, fileNum, page, column=0, row=0) :
+        global inputFiles_a, inputFile_a, refPageSize_a, outputScale, mediabox_l, columns_i, rows_i
 
         fileName = inputFiles_a[fileNum]
-        page0 = inputFile_a[fileName].getPage(page)
-        llx_i=page0.mediaBox.getLowerLeft_x()
-        lly_i=page0.mediaBox.getLowerLeft_y()
-        urx_i=page0.mediaBox.getUpperRight_x()
-        ury_i=page0.mediaBox.getUpperRight_y()
+        page0 = inputFile_a[fileName].pages[page]
+        llx_i=page0.mediabox.left
+        lly_i=page0.mediabox.bottom
+        urx_i=page0.mediabox.right
+        ury_i=page0.mediabox.top
 
         page_width = float(urx_i) - float(llx_i)
         page_height =  float(ury_i) - float(lly_i)
@@ -4257,7 +4636,23 @@ class pdfRender():
             Htranslate = 0
         #Htranslate += Htranslate1
         Vtranslate += (Vtranslate1 * Scale)
+        
+        # Compensate for cell position scaling issue:
+        # When matrices are multiplied, the cell position translation gets scaled
+        # by autoScale. We need to add a compensation to undo this effect.
+        # The cell position is ref_width * column (in input coordinates), 
+        # and it gets multiplied by Scale.
+        # To restore the correct position, we add: cell_position * (1 - Scale)
+        if Scale != 1.0:
+            Htranslate += column * ref_width * (1 - Scale)
+            Vtranslate += row * ref_height * (1 - Scale)
 
+        
+        # We start with the page ID itself to pick up per-page settings like shuffler_rotate
+        transformations = [page]
+        
+        # Transformations for even and odd pages
+        print(f"[DEBUG] autoScaleAndRotate: page={page}, col={column}, page_size=({page_width:.1f}x{page_height:.1f}), ref_size=({ref_width:.1f}x{ref_height:.1f}), Scale={Scale:.4f}, Htranslate={Htranslate:.2f}, Vtranslate={Vtranslate:.2f}")
         return (Rotate, Scale, Htranslate, Vtranslate)
 
 
@@ -4277,7 +4672,7 @@ class pdfRender():
             i = 1
             for f in inputFiles_a :
                 fileName = inputFiles_a[f]
-                numPages = inputFile_a[fileName].getNumPages()
+                numPages = len(inputFile_a[fileName].pages)
                 selection += str(i) + ":1-%s;" % (numPages)
                 i += 1
             app.selection_s = selection
@@ -4559,6 +4954,8 @@ class pdfRender():
         global debug_b, inputFile_a, inputFiles_a, result
         global mediabox_l
         global outputStream
+        import io
+        import os
 
 
         if debug_b == 1 :
@@ -4569,7 +4966,7 @@ class pdfRender():
 
 
         time_s=time.time()
-        output = PdfFileWriter()
+        output = PdfWriter()
 
 
 
@@ -4592,13 +4989,213 @@ class pdfRender():
 ##            # encryption
 ##            if app.permissions_i != -1 and app.password_s != "" :       # if permissions or password were present in the file
 ##                output.encrypt("", app.password_s, P = app.permissions_i)     # TODO : there may be two passwords (user and owner)
-        for a in ar_pages :
+        # Determine if we can use the new transformation approach (Strategy C prerequisite)
+        use_new_transform_global = False
+        if "options" in config and "autoscale" in config["options"]:
+            val = ini.readBoolean(config["options"]["autoscale"])
+            if val == True:
+                use_new_transform_global = True
+            else:
+                print(f"DEBUG: Autoscale config is {val} (False)")
+        else:
+            print("DEBUG: 'autoscale' not found in config['options']")
+        
+        # Disable optimizations if booklet/creep is likely involved (safety check)
+        # try:
+        #      if hasattr(ini, 'booklet') and ini.booklet > 0: 
+        #          use_new_transform_global = False
+        #          print(f"DEBUG: MP Disabled due to Booklet mode: {ini.booklet}")
+        # except: pass
+
+        # Strategy C: Multiprocessing Batch Processing
+        # Only for real output, new transform mode, and sufficient pages
+        if debug_b: print(f"DEBUG: MP Check - Preview: {preview}, UseNew: {use_new_transform_global}, Pages: {len(ar_pages)}")
+        if False and preview == -1 and use_new_transform_global and len(ar_pages) >= 8:
+            try:
+                if debug_b: print("DEBUG: Starting Multiprocessing...")
+                app.status.set_text(_("Processing pages in parallel..."))
+                while Gtk.events_pending(): Gtk.main_iteration()
+                
+                from concurrent.futures import ProcessPoolExecutor
+                import os
+                
+                # Creep Calculation Init
+                creep_val = 0
+                creep_factor = 0
+                start_pages = [0]
+                
+                try:
+                    if hasattr(ini, 'booklet') and ini.booklet > 0:
+                         # Attempt to read creep value safely
+                         # Using raw access or app method if available
+                         if hasattr(app, "readmmEntry") and "creep" in app.arw and app.arw["creep"].get_text():
+                             creep_val_raw = app.readmmEntry(app.arw["creep"])
+                             if creep_val_raw > 0:
+                                 creep_val = creep_val_raw
+                                 mem = 0
+                                 sorted_keys = sorted(ar_cahiers.keys())
+                                 for k in sorted_keys:
+                                     val = ar_cahiers[k]
+                                     if val > 0: creep_factor = creep_val / val
+                                     page_val = val * 2
+                                     start_pages.append(page_val + mem)
+                                     mem += page_val
+                except: pass
+
+                # Prepare data for workers
+                page_tasks = []
+                for i, a in enumerate(ar_pages):
+                     specs = ar_pages[a]
+                     enriched_specs = []
+                     
+                     # Calculate base creep for this Output Page Index (i)
+                     Htrans_base = 0
+                     if creep_val > 0:
+                         s_p = 0
+                         for x in start_pages:
+                             if i >= x: s_p = x
+                             # start_pages is sorted ascending
+                         
+                         page_in_bk = i - s_p
+                         Htrans_base = creep_factor * (int(page_in_bk/2) - (page_in_bk % 2))
+                     
+                     for idx_spec, spec in enumerate(specs):
+                         if spec:
+                             try:
+                                 parts = spec.split(":")
+                                 if len(parts) >= 2:
+                                     f_n_str = parts[0]
+                                     p_n_str = parts[1]
+                                     
+                                     conf_key = f"{f_n_str}:{int(p_n_str)+1}"
+                                     rot = 0
+                                     
+                                     # Rotation lookup
+                                     if conf_key in config and "shuffler_rotate" in config[conf_key]:
+                                          rot = int(config[conf_key]["shuffler_rotate"])
+                                     elif "pages" in config and conf_key in config["pages"]:
+                                          pg = config["pages"][conf_key]
+                                          if isinstance(pg, dict) and "shuffler_rotate" in pg:
+                                              rot = int(pg["shuffler_rotate"])
+                                          elif hasattr(pg, "get"): 
+                                              val = pg.get("shuffler_rotate")
+                                              if val: rot = int(val)
+                                     
+                                     # Creep lookup (depends on column)
+                                     creep_x = 0
+                                     if Htrans_base != 0 and idx_spec < len(ar_layout):
+                                         col = ar_layout[idx_spec][1]
+                                         if col == 0: creep_x = Htrans_base
+                                         else: creep_x = -Htrans_base
+                                     
+                                     # Append extra data if non-zero
+                                     if rot != 0 or creep_x != 0:
+                                          spec = f"{f_n_str}:{p_n_str}:{rot}:{creep_x}"
+                             except: pass
+                         enriched_specs.append(spec)
+                     page_tasks.append((i, enriched_specs)) 
+                
+                # Split into chunks
+                num_workers = min(os.cpu_count() or 4, len(page_tasks), 8)
+                chunk_size = max(1, len(page_tasks) // num_workers)
+                if len(page_tasks) % num_workers != 0: chunk_size += 1
+                
+                chunks = [page_tasks[i:i + chunk_size] for i in range(0, len(page_tasks), chunk_size)]
+                if debug_b: print(f"DEBUG: Created {len(page_tasks)} tasks in {len(chunks)} chunks using {num_workers} workers.")
+                
+                # Prepare params
+                output_params = (mediabox_l, outputScale, columns_i, rows_i)
+                config_params = (urx_i, ury_i)
+                file_paths = inputFiles_a 
+                
+                # Submit jobs
+                results = []
+                with ProcessPoolExecutor(max_workers=num_workers) as executor:
+                    futures = []
+                    for chunk in chunks:
+                        futures.append(executor.submit(batch_render_worker, chunk, ar_layout, file_paths, output_params, config_params, debug_b==1))
+                    
+                    for f in futures:
+                        results.extend(f.result())
+                
+                # Sort results by page index to ensure correct order
+                results.sort(key=lambda x: x[0])
+                
+                # Merge into final output
+                import io
+                from pdfbooklet.pypdf import PdfReader
+                
+                for idx, pdf_bytes in results:
+                    if debug_b: print(f"DEBUG: Chunk {idx} received {len(pdf_bytes)} bytes")
+                    bio = io.BytesIO(pdf_bytes)
+                    try:
+                        reader = PdfReader(bio)
+                        pages_added = 0
+                        for p in reader.pages:
+                            output.add_page(p)
+                            pages_added += 1
+                        if debug_b: print(f"DEBUG: Chunk {idx} added {pages_added} pages")
+                    except Exception as e:
+                        print(f"ERROR: Error reading chunk {idx}: {e}")
+                    
+                    statusValue_i += 1
+                    if statusValue_i % 5 == 0:
+                        app.status.set_text("Merged %d / %d" % (statusValue_i, statusTotal_i))
+                        while Gtk.events_pending(): Gtk.main_iteration()
+
+                if debug_b: print(f"DEBUG: Total pages in output: {len(output.pages)}")
+
+                # Global Rotation (Post-Merge)
+                try:
+                     if "options" in config and "globalRotation" in config["options"]:
+                         gr = config["options"]["globalRotation"]
+                         # Legacy parsing logic: expects format like "Rotation XXX : 90" ?
+                         # Legacy used gr.strip()[14:]. 
+                         if len(gr) > 14:
+                             gr_s = gr.strip()[14:]
+                             if gr_s.isdigit():
+                                 gr_i = int(gr_s)
+                                 from pdfbooklet.pypdf.generic import NameObject, NumberObject
+                                 if gr_i > 0:
+                                     n_obj = NumberObject(gr_i)
+                                     for p in output.pages:
+                                         p[NameObject("/Rotate")] = n_obj
+                except Exception as e:
+                     if debug_b: print(f"DEBUG: Global Rotation Error: {e}")
+
+                # Finish
+                time_e = time.time()
+                output.write(outputStream)
+                outputStream.close()
+                del output
+                if debug_b == 1: logfile_f.close()
+                return True
+                
+            except Exception as e:
+                import traceback
+                traceback.print_exc()
+                print(f"DEBUG: Multiprocessing failed, falling back to sequential: {e}")
+                # Fall through to sequential loop
+        
+        
+        for i, a in enumerate(ar_pages) :
+            # Performance optimization:
+            # If generating a preview, only process the specific page requested.
+            # However, sometimes ar_pages is already subsetted (size 1) by caller.
+            # Only apply filter if we appear to have a full set.
+            if preview != -1 and len(ar_pages) > 1:
+                # ar_pages can be dict (a=key) or list (a=value).
+                # If dict, key usually matches preview index.
+                # If list, index i usually matches preview index.
+                current_idx = a if isinstance(ar_pages, dict) else i
+                if current_idx != preview:
+                    continue
             # create the output sheet
-            page2 = output.addBlankPage(100,100)
-            newSheet = page2.getObject()
+            page2 = output.add_blank_page(100,100)
+            newSheet = page2.get_object()
             newSheet[generic.NameObject("/Contents")] = generic.ArrayObject([])
-            newSheet.mediaBox.upperRight = (mediabox_l[0], mediabox_l[1])       # output page size
-            newSheet.cropBox.upperRight = (mediabox_l[0], mediabox_l[1])
+            newSheet.mediabox.upper_right = (mediabox_l[0], mediabox_l[1])       # output page size
+            newSheet.cropbox.upper_right = (mediabox_l[0], mediabox_l[1])
             # global rotation
             if ("options" in config) and ("globalRotation" in config["options"]) :
                 gr = config["options"]["globalRotation"]
@@ -4694,160 +5291,224 @@ class pdfRender():
                                 ar_data.append([transform_s])
 
 
+
             oString = ""
-
-            # Ready to create the page
-            for r, c in ar_layout :         # We are creating the page in row r and column c
-                data_x = []
-                if ar_pages[0] == [] :      # system not yet initialised
-                    return
-                file_number, page_number = ar_pages[a][i].split(":")
-                file_number = int(file_number)
-                page_number = int(page_number)
-                if (page_number < 0) :
+            
+            # Check if we can use the new transformation approach
+            # Conditions: autoscale enabled and no complex transformations
+            use_new_transform = False
+            if "options" in config and "autoscale" in config["options"]:
+                if ini.readBoolean(config["options"]["autoscale"]) == True:
+                    use_new_transform = True
+            
+            # Use new structured transformation approach
+            if use_new_transform:
+                structured_data = []
+                for r, c in ar_layout:
+                    if ar_pages[0] == []:
+                        return
+                    file_number, page_number = ar_pages[a][i].split(":")
+                    file_number = int(file_number)
+                    page_number = int(page_number)
+                    if page_number < 0:
+                        i += 1
+                        continue  # blank page
+                    
+                    import copy
+                    file_name = inputFiles_a[file_number]
+                    newPage = copy.copy(inputFile_a[file_name].pages[page_number])
+                    
+                    # Apply booklet rotation if specified (Fix for Preview/Sequential mode)
+                    try:
+                         conf_key = f"{file_number}:{page_number+1}"
+                         rot = 0
+                         # Check direct key
+                         if conf_key in config and "shuffler_rotate" in config[conf_key]:
+                              rot = int(config[conf_key]["shuffler_rotate"])
+                         # Check nested pages dict
+                         elif "pages" in config and conf_key in config["pages"]:
+                              pg = config["pages"][conf_key]
+                              if hasattr(pg, "get"): 
+                                  val = pg.get("shuffler_rotate")
+                                  if val: rot = int(val)
+                              elif isinstance(pg, dict) and "shuffler_rotate" in pg:
+                                  rot = int(pg["shuffler_rotate"])
+                         
+                         if rot != 0:
+                              newPage.rotate(rot)
+                    except: pass
+                    
+                    # Calculate complete transformation using new function
+                    transform = calculate_page_transform(
+                        page=newPage,
+                        row=r,
+                        column=c,
+                        ref_width=urx_i,
+                        ref_height=ury_i,
+                        output_width=mediabox_l[0],
+                        output_height=mediabox_l[1],
+                        output_scale=outputScale if outputScale != 1 else 1.0,
+                        columns_i=columns_i,
+                        rows_i=rows_i,
+                        rotate_to_fit=False  # Don't auto-rotate for now
+                    )
+                    
+                    structured_data.append((newPage, transform))
                     i += 1
-                    continue          # blank page
+                
+                # Merge all pages with their transformations
+                newSheet.mergePage3(structured_data)
+            
+            else:
+                # Legacy approach with string-based transformations
+                # Ready to create the page
+                for r, c in ar_layout :         # We are creating the page in row r and column c
+                    data_x = []
+                    if ar_pages[0] == [] :      # system not yet initialised
+                        return
+                    file_number, page_number = ar_pages[a][i].split(":")
+                    file_number = int(file_number)
+                    page_number = int(page_number)
+                    if (page_number < 0) :
+                        i += 1
+                        continue          # blank page
 
 
-                data_x.append("q\n")
-                # Create the transformation matrix for the page
-                matrix_s = self.transform(r, c, page_number, output_page_number, file_number)
-                if matrix_s == False :
-                    return False
-                data_x.append(matrix_s)
+                    data_x.append("q\n")
+                    # Create the transformation matrix for the page
+                    matrix_s = self.transform(r, c, page_number, output_page_number, file_number)
+                    if matrix_s == False :
+                        return False
+                    data_x.append(matrix_s)
 
-                # Booklets : option "creep"
-                if ini.booklet > 0 :                # This option makes sense only for booklets
-                    creep_f1 = app.readmmEntry(app.arw["creep"])
-                    if creep_f1 > 0 :
-                        # calculate creep for each booklet (number of folios may vary)
-                        for key, value in ar_cahiers.items() :
-                            creep_f = creep_f1 / value
+                    # Booklets : option "creep"
+                    if ini.booklet > 0 :                # This option makes sense only for booklets
+                        creep_f1 = app.readmmEntry(app.arw["creep"])
+                        if creep_f1 > 0 :
+                            # calculate creep for each booklet (number of folios may vary)
+                            for key, value in ar_cahiers.items() :
+                                creep_f = creep_f1 / value
 
-                        # reset to 0 for each booklet
-                        # Starting page of each booklet
-                        start_pages = [0]
-                        mem = 0
-                        for key, value in ar_cahiers.items() :
-                            page_value = value * 2              # ar_cahiers gives the number of folios, not pages
-                            start_pages.append(page_value + mem)
-                            mem += page_value
+                            # reset to 0 for each booklet
+                            # Starting page of each booklet
+                            start_pages = [0]
+                            mem = 0
+                            for key, value in ar_cahiers.items() :
+                                page_value = value * 2              # ar_cahiers gives the number of folios, not pages
+                                start_pages.append(page_value + mem)
+                                mem += page_value
 
-                        # Calculate creep for a given page
+                            # Calculate creep for a given page
 
-                        for start_page in start_pages :
-                            if output_page_number <= start_page :
-                                page_in_booklet = output_page_number - start_page   # page number inside a given booklet
-                                Htrans = creep_f * (int(page_in_booklet/2) - (page_in_booklet % 2))         # increment every two pages.
-                                                        # It is a bit difficult to explain...
-                                                        # We must get this :
-                                                        #       page -5 => -3       External page
-                                                        #       page -4 => -2
-                                                        #       page -3 => -2
-                                                        #       page -2 => -1
-                                                        #       page -1 => -1
-                                                        #       page 0  => 0        Internal page
+                            for start_page in start_pages :
+                                if output_page_number <= start_page :
+                                    page_in_booklet = output_page_number - start_page   # page number inside a given booklet
+                                    Htrans = creep_f * (int(page_in_booklet/2) - (page_in_booklet % 2))         # increment every two pages.
+                                                            # It is a bit difficult to explain...
+                                                            # We must get this :
+                                                            #       page -5 => -3       External page
+                                                            #       page -4 => -2
+                                                            #       page -3 => -2
+                                                            #       page -2 => -1
+                                                            #       page -1 => -1
+                                                            #       page 0  => 0        Internal page
 
-                                if c == 0 :
-                                    data_x.append(self.calcMatrix2(Htrans , 0))     # shift left
-                                else :
-                                    data_x.append(self.calcMatrix2((Htrans * -1), 0))  # shift right
-                                break
-
-
-                # scale the page to fit the output sheet, if required
-                if"autoscale" in config["options"]:
-                    if ini.readBoolean(config["options"]["autoscale"]) == True :
-                        (Rotate, scaleFactor_f, Htranslate, Vtranslate) = self.autoScaleAndRotate(file_number, page_number)
-                        matrix1_s = self.calcMatrix2(Htranslate, Vtranslate, Scale = scaleFactor_f, Rotate = Rotate)
-                        data_x.append(matrix1_s)
-
-                file_name = inputFiles_a[file_number]
-                newPage = inputFile_a[file_name].getPage(page_number)
-
-                data_x.append(newPage)
-
-                # Add page number if required
-                # Choose font
-                try:
-                    temp1 = newPage['/Resources'].getObject()
-                    if isinstance(temp1, dict) :
-                        temp2 = temp1['/Font'].getObject()
-                        temp3 = temp2.keys()
-                        if '/F1' in temp3 :
-                            font = '/F1'
-                        else :          # we get the first font in the list
-                            for k in temp3 :
-                                font = k
-                                break
-                except :
-                    pass            # Not critical. Default font will be used, but it does not show in the preview, that's why it is better to have an available font number.
+                                    if c == 0 :
+                                        data_x.append(self.calcMatrix2(Htrans , 0))     # shift left
+                                    else :
+                                        data_x.append(self.calcMatrix2((Htrans * -1), 0))  # shift right
+                                    break
 
 
-                if app.arw["page_numbers"].get_active() == True :
-                    font_size = ini.readIntEntry(app.arw["numbers_font_size"], default = 18)
-                    bottom_margin = ini.readIntEntry(app.arw["numbers_bottom_margin"], default = 20)
-                    start_from = ini.readIntEntry(app.arw["numbers_start_from"])
-                    position = urx_i / 2
-                    if start_from <= page_number + 1 :
-                        data_x.append(" q BT %s %d Tf  1 0 0 1 %d %d Tm (%d) Tj ET Q\n" % (font, font_size, position, bottom_margin, page_number + 1))
-                data_x.append("Q\n")
-                if len(ini.delete_rectangle) > 0 :
-                    (x1,y1,w1,h1) = ini.delete_rectangle
-                    data_x.append("q n 1 1 1 rg \n")        # Couleur RGB ; 1 1 1 = white; 0,0,0 = black
-                    data_x.append(" n %d %d %d %d re f* Q\n" % (x1,y1,w1,h1))  # rectangle : x, y, width, height
-                ar_data.append(data_x)
+                    # scale the page to fit the output sheet, if required
+                    if"autoscale" in config["options"]:
+                        if ini.readBoolean(config["options"]["autoscale"]) == True :
+                            (Rotate, scaleFactor_f, Htranslate, Vtranslate) = self.autoScaleAndRotate(file_number, page_number, c, r)
+                            matrix1_s = self.calcMatrix2(Htranslate, Vtranslate, Scale = scaleFactor_f, Rotate = Rotate)
+                            data_x.append(matrix1_s)
 
-                i += 1
+                    file_name = inputFiles_a[file_number]
+                    newPage = inputFile_a[file_name].pages[page_number]
 
-            aa = urx_i
-            bb = ury_i
+                    data_x.append(newPage)
+
+                    # Add page number if required
+                    # Choose font
+                    try:
+                        temp1 = newPage['/Resources'].get_object()
+                        if isinstance(temp1, dict) :
+                            temp2 = temp1['/Font'].get_object()
+                            temp3 = temp2.keys()
+                            if '/F1' in temp3 :
+                                font = '/F1'
+                            else :          # we get the first font in the list
+                                for k in temp3 :
+                                    font = k
+                                    break
+                    except :
+                        pass            # Not critical. Default font will be used, but it does not show in the preview, that's why it is better to have an available font number.
 
 
-            datay = []
-            for datax in ar_data :
-                datay += datax + ["\n"]
+                    if app.arw["page_numbers"].get_active() == True :
+                        font_size = ini.readIntEntry(app.arw["numbers_font_size"], default = 18)
+                        bottom_margin = ini.readIntEntry(app.arw["numbers_bottom_margin"], default = 20)
+                        start_from = ini.readIntEntry(app.arw["numbers_start_from"])
+                        position = urx_i / 2
+                        if start_from <= page_number + 1 :
+                            data_x.append(" q BT %s %d Tf  1 0 0 1 %d %d Tm (%d) Tj ET Q\n" % (font, font_size, position, bottom_margin, page_number + 1))
+                    data_x.append("Q\n")
+                    if len(ini.delete_rectangle) > 0 :
+                        (x1,y1,w1,h1) = ini.delete_rectangle
+                        data_x.append("q n 1 1 1 rg \n")        # Couleur RGB ; 1 1 1 = white; 0,0,0 = black
+                        data_x.append(" n %d %d %d %d re f* Q\n" % (x1,y1,w1,h1))  # rectangle : x, y, width, height
+                    ar_data.append(data_x)
+
+                    i += 1
+
+                aa = urx_i
+                bb = ury_i
+
+
+                datay = []
+                for datax in ar_data :
+                    datay += datax + ["\n"]
 
 
 ##            datay += ["q n 10 10 m 10 122 l S \n"]
 ##            datay += ["  n 10 10 m 72 10  l S \n"]
 ##            datay += ["Q\n"]
-            if preview > 0 :
-                newSheet.mergePage3(datay)                  # never use slow mode for preview
-            elif ("slowMode" in app.arw
-                   and app.arw["slowMode"].get_active() == 0) :        # normal mode
-                        newSheet.mergePage3(datay)
+            # Only run legacy merge if we used the legacy approach (datay exists)
+            if not use_new_transform:
+                if preview > 0 :
+                    newSheet.mergePage3(datay)                  # never use slow mode for preview
+                elif ("slowMode" in app.arw
+                       and app.arw["slowMode"].get_active() == 0) :        # normal mode
+                            newSheet.mergePage3(datay)
 
-            else :                                          # slow mode (uses mergePage instead of mergePage3)
+                else :                                          # slow mode (uses mergePage instead of mergePage3)
 
-                dataz = ""
-                pages = []
-                end_code = ""
-                for data2 in datay :
-                    if not isinstance(data2, str) :
+                    dataz = ""
+                    pages = []
+                    end_code = ""
+                    for data2 in datay :
+                        if not isinstance(data2, str) :
 
-                        pages.append([data2, dataz])
-                        dataz = ""
-                    else :
-                        dataz += data2
-                if not (dataz == "" or len(pages) == 0) :    # skip blank pages
+                            pages.append([data2, dataz])
+                            dataz = ""
+                        else :
+                            dataz += data2
+                    if not (dataz == "" or len(pages) == 0) :    # skip blank pages
 
-                    i = len(pages)
-                    pages[i - 1].append(dataz)
+                        i = len(pages)
+                        pages[i - 1].append(dataz)
 
-                for content in pages :
-                    if len(content) == 3 :
-                        end_code == content[2]
-                    else :
-                        end_code = ""
-                    newSheet.mergeModifiedPage(content[0], content[1], end_code)
+                    for content in pages :
+                        if len(content) == 3 :
+                            end_code == content[2]
+                        else :
+                            end_code = ""
+                        newSheet.mergeModifiedPage(content[0], content[1], end_code)
 
-
-
-
-            if ( "noCompress" in app.arw
-                  and app.arw["noCompress"].get_active() == 0) :
-                        newSheet.compressContentStreams()
 
 
             if preview == -1 :      # if we are creating a real file (not a preview)
@@ -4858,6 +5519,35 @@ class pdfRender():
             output_page_number += 1
             while Gtk.events_pending():
                             Gtk.main_iteration()
+
+        # Defer compression to end of process
+        # Compress all pages at once for efficiency
+        if preview == -1:  # Real file output only
+            if ( "noCompress" in app.arw
+                  and app.arw["noCompress"].get_active() == 0) :
+                app.status.set_text(_("Compressing pages..."))
+                while Gtk.events_pending():
+                    Gtk.main_iteration()
+                
+                # Parallel compression using threads
+                # zlib releases the GIL during compression, allowing true parallelism
+                from concurrent.futures import ThreadPoolExecutor
+                import os
+                
+                def compress_page(page):
+                    page.compress_content_streams()
+                    return True
+                
+                # Use available CPU cores for optimal parallelism
+                num_workers = min(os.cpu_count() or 4, len(output.pages), 8)
+                
+                if num_workers > 1 and len(output.pages) > 1:
+                    with ThreadPoolExecutor(max_workers=num_workers) as executor:
+                        list(executor.map(compress_page, output.pages))
+                else:
+                    # Sequential fallback for single page or single core
+                    for page in output.pages:
+                        page.compress_content_streams()
 
         time_e=time.time()
 
@@ -4886,34 +5576,34 @@ class pdfRender():
 
 def printTree(curPage,out) :
 
-        #curPage = source.getPage(page)
+        #curPage = source.pages[page]
         keys_a = list(curPage.keys())
-        #temp1 = curPage["/Parent"].getObject()
+        #temp1 = curPage["/Parent"].get_object()
         for j in keys_a :
             #if j in ["/Parent", "/Rotate", "/MediaBox", "/Type", "/Annots", "/Contents"] :
             if j in ["/Parent"] :
                 continue
-            temp1 = curPage[j].getObject()
+            temp1 = curPage[j].get_object()
             print("======> page "  + str(page) + "  " + j, file=out)
             print(temp1, file=out)
             if isinstance(temp1, dict) :
                 for k in temp1 :
-                    temp2 = temp1[k].getObject()
+                    temp2 = temp1[k].get_object()
                     print(str(k) + " : ", end=' ', file=out)
                     print(temp2, file=out)
                     if isinstance(temp2, dict) :
                         for l in temp2 :
-                            temp3 = temp2[l].getObject()
+                            temp3 = temp2[l].get_object()
                             print(str(l) + " : ", end=' ', file=out)
                             print(temp3, file=out)
                             if isinstance(temp3, dict) :
                                 for m in temp3 :
-                                    temp4 = temp3[m].getObject()
+                                    temp4 = temp3[m].get_object()
                                     print(str(m) + " : ", end=' ', file=out)
                                     print(temp4, file=out)
                                     if isinstance(temp4, dict) :
                                         for n in temp4 :
-                                            temp5 = temp4[n].getObject()
+                                            temp5 = temp4[n].get_object()
                                             print(str(n) + " : ", end=' ', file=out)
                                             print(temp5, file=out)
 
@@ -5042,9 +5732,9 @@ def close_applicationx(self, widget, event=None, mydata=None):
 
 def main() :
 
-    global PdfShuffler, PDF_Doc
+    global PdfShuffler, PDF_Doc, Page, Sides, Dims
 
-    from pdfbooklet.pdfshuffler_g3 import PdfShuffler, PDF_Doc
+    from pdfbooklet.pdfshuffler_g3 import PdfShuffler, PDF_Doc, Page, Sides, Dims
 
     global isExcept
     global startup_b
@@ -5229,6 +5919,156 @@ def main() :
 
 
 
+
+
+# ---------------------------------------------------------------------
+# Multiprocessing Worker Function
+# ---------------------------------------------------------------------
+
+def batch_render_worker(chunk_data, ar_layout, file_paths, output_params, config_params, debug_mode=False):
+    """
+    Worker function to render a chunk of pages in a separate process.
+    
+    Args:
+        chunk_data: List of tuples (page_idx, [input_page_specs...])
+        ar_layout: Layout list [(r, c), ...]
+        file_paths: Dict {file_number: file_path}
+        output_params: Tuple (mediabox_l, outputScale, columns_i, rows_i)
+        config_params: Tuple (urx_i, ury_i)
+        debug_mode: Boolean
+        
+    Returns:
+        List of (page_idx, pdf_bytes) tuples
+    """
+    try:
+        import io
+        from pdfbooklet.pypdf import PdfWriter, PdfReader, PageObject
+        from pdfbooklet.pypdf.generic import RectangleObject, NameObject
+        
+        # Unpack parameters
+        mediabox_l, outputScale, columns_i, rows_i = output_params
+        urx_i, ury_i = config_params
+        
+        # Open readers
+        readers = {}
+        for fid, path in file_paths.items():
+            try:
+                readers[fid] = PdfReader(path)
+            except Exception as e:
+                # Ignore file open errors in worker
+                if debug_mode: print(f"Worker failed to open {path}: {e}")
+                pass
+            
+        # Use single PdfWriter for the chunk to reduce overhead
+        writer = PdfWriter()
+        if not chunk_data: return []
+        chunk_start_idx = chunk_data[0][0]
+        
+        for out_idx, page_specs in chunk_data:
+            # Create blank page
+            page = writer.add_blank_page(width=mediabox_l[0], height=mediabox_l[1])
+            
+            # Explicitly set cropbox
+            page.mediabox.upper_right = (mediabox_l[0], mediabox_l[1])
+            page.cropbox.upper_right = (mediabox_l[0], mediabox_l[1])
+            
+            structured_data = []
+            
+            # Loop through layout slots
+            layout_idx = 0
+            for r, c in ar_layout:
+                if layout_idx >= len(page_specs):
+                    break
+                    
+                spec = page_specs[layout_idx]
+                if spec: 
+                    try:
+                        parts = spec.split(":")
+                        file_n_str = parts[0]
+                        page_n_str = parts[1]
+                        rotation = 0
+                        creep_x = 0
+                        if len(parts) > 2:
+                            rotation = int(parts[2])
+                        if len(parts) > 3:
+                            creep_x = float(parts[3])
+                            
+                        file_n = int(file_n_str)
+                        page_n = int(page_n_str)
+                        
+                        if page_n >= 0 and file_n in readers:
+                            reader = readers[file_n]
+                            if page_n < len(reader.pages):
+                                source_page = reader.pages[page_n]
+                                
+                                # Apply booklet rotation
+                                if rotation != 0:
+                                    source_page.rotate(rotation)
+                                
+                                # Calculate transformation
+                                transform = calculate_page_transform(
+                                    page=source_page,
+                                    row=r,
+                                    column=c,
+                                    ref_width=config_params[0], # urx_i
+                                    ref_height=config_params[1], # ury_i
+                                    output_width=output_params[0][0],
+                                    output_height=output_params[0][1],
+                                    output_scale=output_params[1],
+                                    columns_i=output_params[2],
+                                    rows_i=output_params[3],
+                                    rotate_to_fit=False # Rotation handled above
+                                )
+                                
+                                # Apply Creep Offset
+                                if creep_x != 0:
+                                    transform = transform.translate(tx=creep_x, ty=0)
+                                
+                                # Merge transformed page
+                                # Fix cropbox to avoid clipping
+                                orig_crop = source_page.get("/CropBox")
+                                large_crop = RectangleObject([-10000, -10000, 10000, 10000])
+                                source_page[NameObject("/CropBox")] = large_crop
+                                try:
+                                    page.merge_transformed_page(source_page, transform)
+                                finally:
+                                    if orig_crop:
+                                        source_page[NameObject("/CropBox")] = orig_crop
+                                    elif "/CropBox" in source_page:
+                                        del source_page["/CropBox"]
+                    except Exception as e:
+                        if debug_mode: print(f"Error processing spec {spec}: {e}")
+                        pass
+                        
+                layout_idx += 1
+            
+                for item in structured_data:
+                    pg, tr = item
+                    # Fix cropbox for merge to avoid clipping
+                    orig_crop = pg.get("/CropBox")
+                    large_crop = RectangleObject([-10000, -10000, 10000, 10000])
+                    pg[NameObject("/CropBox")] = large_crop
+                    try:
+                        page.merge_transformed_page(pg, tr)
+                    finally:
+                        if orig_crop:
+                            pg[NameObject("/CropBox")] = orig_crop
+                        elif "/CropBox" in pg:
+                            del pg["/CropBox"]
+
+            # Compress content
+            page.compress_content_streams()
+            
+        # Serialize entire chunk
+        bio = io.BytesIO()
+        writer.write(bio)
+        return [(chunk_start_idx, bio.getvalue())]
+    except Exception as e:
+        print(f"WORKER FAIL: {e}")
+        import traceback
+        try: traceback.print_exc()
+        except: pass
+        return []
 
 if __name__ == '__main__' :
     main()

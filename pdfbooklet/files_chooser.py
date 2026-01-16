@@ -9,7 +9,7 @@ import os, sys
 
 
 from gi.repository import Gtk, Gio
-from pdfbooklet.PyPDF2_G import PdfFileReader
+from pdfbooklet.pypdf import PdfReader
 
 
 def alert(message, type = 0) :
@@ -139,8 +139,8 @@ class Chooser:
 
     def loadPdfFile(self,filename) :
 
-        pdfFile = PdfFileReader(open(filename, "rb"))
-        numpages = pdfFile.getNumPages()
+        pdfFile = PdfReader(open(filename, "rb"))
+        numpages = len(pdfFile.pages)
         self.treestore.append([filename, numpages])
 
     # regenerate the array of files (easier to use than the treestore)

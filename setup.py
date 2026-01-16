@@ -49,16 +49,16 @@ data_files=[('/usr/share/pdfbooklet/data', glob.glob('pdfbooklet/data/*.*')),
 
 
 setup(name='pdfbooklet',
-      version='3.1.4e',
+      version='3.1.6',
       author='GAF Software',
       author_email='Averell7 at sourceforge dot net',
-      maintainer='Averell7',
-      maintainer_email='Averell7 at sourceforge dot net',
+      maintainer='Tomas Julian Resquin',
+      maintainer_email='tomasjulianresquin at proton dot me',
       description='A simple application for creating booklets and other layouts from PDF files',
-      url='https://github.com/Averell7/PdfBooklet',
+      url='https://github.com/TomasResquin/PdfBooklet',
       license='GNU GPL-3',
       scripts=['bin/pdfbooklet'],
-      packages=['pdfbooklet', 'pdfbooklet.PyPDF2_G'],
+      packages=['pdfbooklet', 'pdfbooklet.pypdf', 'pdfbooklet.pypdf._codecs', 'pdfbooklet.pypdf._crypt_providers', 'pdfbooklet.pypdf._text_extraction', 'pdfbooklet.pypdf._text_extraction._layout_mode', 'pdfbooklet.pypdf.annotations', 'pdfbooklet.pypdf.generic', 'pdfbooklet.pdfarranger'],
       data_files=data_files,
       #requires=['python-poppler'],          # for distutils
       #install_requires=['python-poppler']   # for setuptools  should work but does not. We can use setup.cfg instead

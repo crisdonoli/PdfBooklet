@@ -45,7 +45,7 @@ def fix_bin_file(file1):
 
 pyinstaller_file = ""
 
-version = "3.1.2"
+version = "3.1.6"
 print ("\n\n ================ start bdist =============================\n\n")
 # creates pdfbooklet-3.x.x.linux-[system].tar.gz
 os.system('python3 setup.py bdist > /dev/null')

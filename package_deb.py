@@ -10,7 +10,7 @@ def run_command(command):
 
 def main():
     app_name = "pdfbooklet"
-    version = "3.1.4e"
+    version = "3.1.6"
     arch = "all"
     package_name = f"{app_name}_{version}_{arch}"
     build_dir = os.path.abspath("build_deb")
@@ -38,7 +38,7 @@ Section: utils
 Priority: optional
 Architecture: {arch}
 Depends: python3, python3-gi, python3-gi-cairo, python3-cairo, gir1.2-gtk-3.0, gir1.2-poppler-0.18
-Maintainer: GAF Software <Averell7@sourceforge.net>
+Maintainer: Tomas Julian Resquin <tomasjulianresquin@proton.me>
 Description: A simple application for creating booklets and other layouts from PDF files
  PdfBooklet is a GTK+ based utility to create booklets and other layouts 
  from PDF documents.
