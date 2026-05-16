@@ -1,32 +1,34 @@
-# tools, IDEs
-/.idea/
-/*.geany
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+*.egg
+*.eggs/
+.venv/
 
-# build files and folders
+# Build output
+/build/
+/dist/
+/builds/
+/build_deb/
+*.deb
+*.spec
+*.msi
+
+# Development scripts and temp files
+/dev_scripts/
+
+# IDE / Editor
+/.idea/
+/.vscode/
+*.geany
+*.code-workspace
+.sass-cache/
+
+# Test / CI
 /.cache/
 /.coverage
 /coverage.xml
-.sass-cache/
 /.tox/
-/build/
-/dist/
-/*.egg/
-/*.egg-info/
-/*.eggs/
-/docs/build/
-
-# test projects and data
-/manage.py
-/test_project_*/
 /unittests.xml
-
-# Django and Python
-/static/
-/media/
-*.py[cod]
-
-# Virtualenv magic, see https://gist.github.com/bittner/8830745
-.venv
-build_deb/
-*.deb
-PdfBooklet.code-workspace
+/test_project_*/
