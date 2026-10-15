@@ -454,6 +454,13 @@ _CACHED_LAYOUT_DATA = None  # (ar_pages, ar_layout, ar_cahiers)
 _PREVIEW_BYTES_CACHE = {} # map: page -> pdf_bytes
 _PREVIEW_BYTES_LRU = []   # list of cached pages (for LRU eviction)
 
+# Reading-order index (1-based) of each cell of each sheet. Filled by
+# pdfRender.createPageLayout() and used by the preview to show the folding order.
+ar_order = {}
+
+# Booklet (cahier) number of each sheet. Filled by pdfRender.createPageLayout().
+ar_booklet = {}
+
 def join_list(my_list, separator) :
     mydata = ""
     if isinstance(my_list, list) :
@@ -1748,11 +1755,96 @@ class gtkGui(TxtOnly):
 
 
 
-
         config[Id]["rotate"] = str(value)
 
         self.preview(self.previewPage, 0)
 
+
+    def popup_delete_page(self, widget):
+        # Called by popup menu (right clic on preview) : removes the selected
+        # page from the page selection.
+        self.edit_selection_page(delete=True)
+
+
+    def popup_insert_blank_before_page(self, widget):
+        # Called by popup menu (right clic on preview) : inserts a blank page
+        # just before the selected page in the page selection.
+        self.edit_selection_page(delete=False)
+
+
+    def expand_selection(self):
+        """Expand self.selection_s into a flat list of page tokens.
+
+        Tokens use the same format as the user selection : "file:page" with
+        1-based page numbers, "1:-1" for a blank page. Blank and trailing
+        spaces are ignored. Returns an empty list when no file is loaded.
+        """
+        if len(inputFiles_a) == 0:
+            return []
+        sel = self.selection_s or ""
+        sel = re.sub("[;,]{2,}", ";", sel)
+        sel = sel.replace(";", ",").strip()
+        if sel == "":
+            # Default selection : all pages of all files, in file order
+            tokens = []
+            for f in inputFiles_a:
+                nb = len(inputFile_a[inputFiles_a[f]].pages)
+                tokens += [str(f) + ":" + str(x) for x in range(1, nb + 1)]
+            return tokens
+        tokens = []
+        for a in sel.split(","):
+            a = a.strip()
+            if a == "":
+                continue
+            b = a.split(":")
+            if len(b) == 1:
+                docId_s = "1:"
+                a = b[0]
+            else:
+                docId_s = b[0] + ":"
+                a = b[1]
+            if a.count("-") > 0:
+                list2 = a.split("-")
+                for x in range(int(list2[0]), int(list2[1]) + 1):
+                    tokens.append(docId_s + str(x))
+            elif a[-1:] == "b":
+                if a[0:-1].strip() == "":
+                    n = 1
+                else:
+                    n = int(a[0:-1])
+                tokens += ["1:-1"] * n
+            else:
+                tokens.append(docId_s + str(int(a)))
+        return tokens
+
+
+    def edit_selection_page(self, delete):
+        """Rewrite self.selection_s to either delete the selected page or
+        insert a blank page before it, then refresh preview and shuffler."""
+        global selected_page
+        if selected_page is None or len(inputFiles_a) == 0:
+            showwarning(_("No selection"), _("There is no selected page. \nPlease select a page first. "))
+            return
+        tokens = self.expand_selection()
+        # selected_page[2] is the file number and selected_page[3] the 1-based page number
+        token = str(selected_page[2]) + ":" + str(int(selected_page[3]))
+        if token not in tokens:
+            return
+        if delete:
+            if len(tokens) <= 1:
+                showwarning(_("Cannot delete"), _("The selection must contain at least one page."))
+                return
+            tokens.remove(token)
+        else:
+            tokens.insert(tokens.index(token), "1:-1")
+        self.selection_s = self.compressSelection(tokens)
+        if self.arranger_view:
+            self.arranger_view.model.clear()
+            self.arranger_view.pdfqueue = []
+            self.arranger_view.nfile = 0
+            self.loadShuffler()
+            self.arranger_view.rendering_thread.pdfqueue = self.arranger_view.pdfqueue
+        self.previewUpdate()
 
 
     def __________________INI_FILE() :
@@ -1921,6 +2013,7 @@ class gtkGui(TxtOnly):
         self.setOption("numfolio", self.arw["entry13"])
         self.setOption("prependPages", self.arw["entry32"])
         self.setOption("appendPages", self.arw["entry33"])
+        self.setOption("chapters", self.arw["entry_chapters"])
         self.setOption("referencePage", self.arw["entry31"])
         self.setOption("creep", self.arw["creep"])
         self.setOption("output", self.arw["entry2"])
@@ -2012,6 +2105,7 @@ class gtkGui(TxtOnly):
         config["options"]["numfolio"] = self.arw["entry13"].get_text()
         config["options"]["prependPages"] = self.arw["entry32"].get_text()
         config["options"]["appendPages"] = self.arw["entry33"].get_text()
+        config["options"]["chapters"] = self.arw["entry_chapters"].get_text()
         config["options"]["referencePage"] = self.arw["entry31"].get_text()
         config["options"]["creep"] = self.arw["creep"].get_text()
         config["options"]["pageSelection"] = self.selection_s    # TODO : is this a good idea ?
@@ -2473,37 +2567,48 @@ class gtkGui(TxtOnly):
             current_pages = list(self.ar_pages.values())[0]
             pageRef_s = current_pages[i]
             file_number, page_number = pageRef_s.split(":")
+            is_blank = (page_number == "-1")
             page_number = int(page_number) + 1
-            if file_number == "1" :
-                pageNumber = str(page_number)
-            else :
-                pageNumber = str(file_number) + ":" + str(page_number)
 
+            # reading order (folding order) of this cell
+            order_list = getattr(self, "ar_order_list", [])
+            order_i = order_list[i] if i < len(order_list) else 0
 
-            fontsize_i = int(columnWidth / 4)
-            if fontsize_i < 10 :
-                fontsize_i = 10
-            colpos_i = previewColPos_a[a[1]] + (columnWidth / 2)
-            rowpos_i = previewRowPos_a[a[0]] - (rowHeight / 2)
-            x1,x2 = colpos_i,rowpos_i
+            # booklet (cahier) number of this cell
+            booklet_list = getattr(self, "ar_booklet_list", [])
+            booklet_i = booklet_list[i] if i < len(booklet_list) else 0
 
-            # draw page number
+            # draw the info box (file / source page / folded order / booklet)
             if self.arw["hide_numbers"].get_active() == 0 :
-                # TODO cr.select_font_face("Georgia",
-    ##                cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_BOLD)
-    ##            AttributeError: 'gi.repository.cairo' object has no attribute 'FONT_SLANT_NORMAL'
-    ##            Remplacé par 0 et 1 ci-dessous
                 cr.select_font_face("Georgia", 0, 1)
+                fontsize_i = max(7, int(columnWidth / 32))
                 cr.set_font_size(fontsize_i)
-                x_bearing, y_bearing, txtWidth, txtHeight = cr.text_extents(pageNumber)[:4]
 
-                colpos_i -= int(txtWidth / 4)
-                rowpos_i -= int(txtHeight / 4)
+                src_s = "-" if is_blank else str(page_number)
+                ord_s = str(order_i) if order_i != 0 else "-"
+                bklt_s = str(booklet_i) if booklet_i != 0 else "-"
+                lines = ["file: " + str(file_number),
+                         "source page: " + src_s,
+                         "folded order: " + ord_s,
+                         "booklet: " + bklt_s]
 
+                line_h = fontsize_i + 2
+                pad = max(2, int(fontsize_i / 2))
+                txtWidth = max(cr.text_extents(t)[2] for t in lines)
+                box_w = int(txtWidth) + 2 * pad
+                box_h = line_h * len(lines) + 2 * pad
 
-                cr.move_to(colpos_i, rowpos_i - y_bearing)
-                cr.set_source_rgba(1, 0, 0, 0.6)
-                cr.show_text(pageNumber)
+                # top left corner of the cell
+                box_x = previewColPos_a[a[1]] + pad
+                box_y = (previewRowPos_a[a[0]] - rowHeight) + pad
+
+                cr.set_source_rgba(1, 1, 1, 0.8)
+                cr.rectangle(box_x, box_y, box_w, box_h)
+                cr.fill()
+                cr.set_source_rgba(1, 0, 0, 0.9)
+                for idx, t in enumerate(lines) :
+                    cr.move_to(box_x + pad, box_y + pad + fontsize_i + idx * line_h)
+                    cr.show_text(t)
 
             pageId = str(a[0]) + ":" + str(a[1])
             pageContent_a[pageId] = [file_number, page_number]
@@ -2684,11 +2789,11 @@ class gtkGui(TxtOnly):
                 Id = str(str(selected_page[5] + 1) + "," + str(humanReadableRow_i))
 
         elif event.type == Gdk.EventType.BUTTON_PRESS:
-            if event.button == 3 :            # right click, runs the context menu
-                self.arw["contextmenu1"].popup_at_pointer(event)
-                return
+            # Both left and right clicks select the page under the cursor, so
+            # that the context menu (right click) always acts on the clicked page.
+            right_click_menu = (event.button == 3)
 
-            else :
+            if event.button >= 1 :
                 # get preview area
                 left_limit = previewColPos_a[0]
                 bottom_limit = previewRowPos_a[-1]
@@ -2707,6 +2812,8 @@ class gtkGui(TxtOnly):
                     or ypos < bottom_limit
                     or ypos > top_limit) :
 
+                        if right_click_menu :
+                            self.arw["contextmenu1"].popup_at_pointer(event)
                         return
 
                 # find the row and column
@@ -2783,6 +2890,10 @@ class gtkGui(TxtOnly):
                 # force the "draw" signal to update the display
                 self.arw["drawingarea1"].hide()
                 self.arw["drawingarea1"].show()
+
+                if right_click_menu :            # right click, show the context menu on this page
+                    self.arw["contextmenu1"].popup_at_pointer(event)
+                    return
 
 
 
@@ -3136,6 +3247,9 @@ class gtkGui(TxtOnly):
 
                     self.ar_pages = ar_pages
                     self.ar_layout = ar_layout
+                    # reading-order index of each cell of the current sheet
+                    self.ar_order_list = ar_order.get(previewPage, [])
+                    self.ar_booklet_list = ar_booklet.get(previewPage, [])
                     
                     if previewPage in _PREVIEW_BYTES_CACHE:
                         # Move to end of LRU
@@ -3831,7 +3945,12 @@ class pdfRender():
                     pagesSel = pagesSel + [docId_s + a]
                 except :
                     alert("Invalid selection ", a)
+
         if append_prepend == 1 :
+            # Insert blank pages so that every chapter starts on an odd reading
+            # position (= right hand / recto page).
+            pagesSel = self.align_chapters(pagesSel)
+
             pagesSel = pagesSel + appendPages * ["1:-1"]
 
             if ini.booklet > 0 :
@@ -3854,13 +3973,67 @@ class pdfRender():
         return True
 
 
+    def parse_chapter_starts(self) :
+        """Return the chapter start pages as selection tokens ("file:page",
+        0-based page number). Read from the "Chapter starts" entry : a list
+        of pages separated by commas/spaces, each "page" or "file:page", with
+        1-based page numbers, in increasing order."""
+        try :
+            if "entry_chapters" not in app.arw :
+                return []
+            text = app.arw["entry_chapters"].get_text()
+        except :
+            return []
+        tokens = []
+        for a in re.split(r"[,\s;]+", text) :
+            a = a.strip()
+            if a == "" :
+                continue
+            b = a.split(":")
+            if len(b) == 1 :
+                file_s = "1"
+                page_s = b[0]
+            else :
+                file_s = b[0]
+                page_s = b[1]
+            try :
+                page_i = int(page_s)
+            except :
+                continue
+            if page_i < 1 :
+                continue
+            tokens.append(str(file_s) + ":" + str(page_i - 1))
+        return tokens
+
+
+    def align_chapters(self, pages) :
+        """Insert a blank page before any chapter start that would otherwise
+        fall on an even reading position, so that chapters start on a right
+        (recto) page."""
+        chapters = self.parse_chapter_starts()
+        if not chapters :
+            return pages
+        remaining = list(chapters)
+        out = []
+        for tok in pages :
+            if tok in remaining :
+                remaining.remove(tok)
+                if len(out) % 2 == 1 :      # the page would land on an even position
+                    out.append("1:-1")
+            out.append(tok)
+        return out
+
+
     def createPageLayout(self, logdata = 1) :
         global config, rows_i, columns_i, cells_i, step_i, sections, output, input1, adobe_l
         global numfolio,prependPages, appendPages, ref_page, selection
         global numPages, blankPages, pagesSel, llx_i, lly_i, urx_i, ury_i, mediabox_l, pgcount
+        global ar_order, ar_booklet
 
         ar_pages = {}
         ar_cahiers = {}
+        ar_order = {}
+        ar_booklet = {}
         index=0
         last=0
         cells_i = columns_i * rows_i
@@ -3908,6 +4081,8 @@ class pdfRender():
                         pg2 = (last - i)
 
                     ar_pages[index] = [pagesSel[pg1 - 1], pagesSel[pg2 - 1]] * multiple_bkt
+                    ar_order[index] = [pg1, pg2] * multiple_bkt
+                    ar_booklet[index] = [k + 1] * len(ar_pages[index])
                     index += 1
 
         else :
@@ -3915,13 +4090,18 @@ class pdfRender():
                 start = last
                 last = last + step_i
                 pages = []
+                orders = []
                 for a in range(start, start + cells_i) :
                     PageX = start + (a % step_i)
                     if PageX > totalPages :
                         pages = pages + [-1]
+                        orders = orders + [0]
                     else :
                         pages = pages + [pagesSel[PageX]]
+                        orders = orders + [PageX + 1]
                 ar_pages[index] = pages
+                ar_order[index] = orders
+                ar_booklet[index] = [0] * len(pages)
                 index += 1
 
 
@@ -3962,6 +4142,10 @@ class pdfRender():
 
         # User defined layout
         if "radiopreset8" in app.arw and app.arw["radiopreset8"].get_active() == 1 :
+
+            # the reading order of a custom layout is not defined here
+            ar_order = {}
+            ar_booklet = {}
 
             # number of sheets of this layout
             sheets = len(ini.imposition)
