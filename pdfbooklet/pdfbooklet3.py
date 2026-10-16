@@ -238,10 +238,11 @@ gi.require_version('Poppler', '0.18')
 
 from gi.repository import Gtk
 from gi.repository import Gdk
+from gi.repository import GdkPixbuf
 from gi.repository import Poppler
 from gi.repository import Pango
 from gi.repository import Gio, GLib
-from gi.repository import cairo
+import cairo
 
 
 Gtk.rc_parse("./gtkrc")
@@ -1127,6 +1128,8 @@ class gtkGui(TxtOnly):
 
         self.initdrag = []
         self.enddrag = []
+        self.drop_active = False
+        self.drop_rect = None
 
         self.backup = []
         self.backup_index = 0
@@ -1151,6 +1154,13 @@ class gtkGui(TxtOnly):
         #autoconnect signals for self functions
         self.widgets.connect_signals(self)
         self.arw["drawingarea1"].connect('draw', self.OnDraw)
+
+        # Allow PDF files to be dropped anywhere on the startup preview.
+        self.drop_targets = [Gtk.TargetEntry.new('text/uri-list', 0, 0)]
+        drop_zone = self.arw.get("eventbox1", None)
+        if drop_zone is not None:
+            drop_zone.drag_dest_set(Gtk.DestDefaults.ALL, self.drop_targets, Gdk.DragAction.COPY)
+            drop_zone.connect('drag-data-received', self.on_drop_pdf)
 
         self.autoscale = self.arw["autoscale"]
         self.area = self.arw["drawingarea1"]
@@ -1363,6 +1373,61 @@ class gtkGui(TxtOnly):
         app.selection_s = ""
 
         self.previewUpdate()
+
+
+    def on_drop_pdf(self, widget, context, x, y, data, info, time):
+        try:
+            uris = list(data.get_uris() or [])
+        except Exception:
+            uris = []
+        try:
+            from pdfbooklet.pdfarranger.utils.clipboard import get_file_path_from_uri
+        except Exception:
+            get_file_path_from_uri = None
+
+        filenames = []
+        for uri in uris:
+            if not uri:
+                continue
+            try:
+                if get_file_path_from_uri is None:
+                    continue
+                filenames.append(get_file_path_from_uri(uri))
+            except Exception:
+                continue
+        ok = self.import_dropped_pdfs(filenames)
+        try:
+            context.finish(bool(ok), False, time)
+        except Exception:
+            pass
+        return True
+
+
+    def import_dropped_pdfs(self, filenames):
+        global inputFiles_a
+
+        added = []
+        for filename in filenames or []:
+            filename = unicode2(filename, "utf-8")
+            if (filename.lower().endswith(".pdf")
+                    and os.path.isfile(filename)
+                    and filename not in inputFiles_a.values()
+                    and filename not in added):
+                added.append(filename)
+        if not added:
+            alert(_("Only PDF files can be dropped here."))
+            return False
+
+        base = len(inputFiles_a)
+        for offset, filename in enumerate(added, start=1):
+            inputFiles_a[base + offset] = filename
+        self.mru(inputFiles_a, "manager")
+        ini.loadPdfFiles()
+        app.selection_s = ""
+        if self.arranger_view:
+            self.reloadShuffler()
+        self.previewUpdate()
+        return True
 
 
     def FormatPath (
@@ -1844,6 +1909,214 @@ class gtkGui(TxtOnly):
             self.arranger_view.nfile = 0
             self.loadShuffler()
             self.arranger_view.rendering_thread.pdfqueue = self.arranger_view.pdfqueue
+        self.previewUpdate()
+
+
+    def open_chapter_selector(self, widget):
+        """Open a popup with a grid of the source pages. Clicking a page
+        toggles it as a chapter start; the entry is updated on close."""
+        global inputFiles_a, inputFile_a
+
+        if len(inputFiles_a) == 0:
+            showwarning(_("No file loaded"), _("Please select a file first"))
+            return
+
+        # pages already listed in the entry, as 1-based "file:page"
+        selected = set()
+        try:
+            for t in self.render.parse_chapter_starts():
+                f, pg = t.split(":")
+                selected.add(f + ":" + str(int(pg) + 1))
+        except Exception:
+            pass
+
+        dialog = Gtk.Dialog(title=_("Chapter starts (right page)"),
+                            transient_for=self.window1, modal=True)
+        dialog.set_default_size(1024, 720)
+        dialog.add_button(_("Close"), Gtk.ResponseType.CLOSE)
+        dialog.get_content_area().set_spacing(4)
+
+        # model columns: 0 pixbuf, 1 label, 2 token, 3 selected
+        store = Gtk.ListStore(GdkPixbuf.Pixbuf, str, str, bool)
+        view = Gtk.IconView.new_with_model(store)
+        view.set_pixbuf_column(0)
+        view.set_text_column(1)
+        view.set_selection_mode(Gtk.SelectionMode.MULTIPLE)
+        view.set_item_padding(2)
+        view.set_column_spacing(4)
+        view.set_row_spacing(4)
+        view.set_item_width(176)
+        view.set_margin(6)
+        view.set_columns(-1)
+        view.set_name("chapter-iconview")
+        _chapter_css = Gtk.CssProvider()
+        _chapter_css.load_from_data(b"#chapter-iconview { background-color: #ffffff; }")
+        view.get_style_context().add_provider(_chapter_css, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+        view.connect("button-press-event", self.on_chapter_view_click)
+
+        jobs = []
+        idx = 0
+        for f in inputFiles_a:
+            fileName = inputFiles_a[f]
+            try:
+                n = len(inputFile_a[fileName].pages)
+            except Exception:
+                continue
+            for p in range(1, n + 1):
+                token = str(f) + ":" + str(p)
+                is_selected = token in selected
+                label = ("[X] " if is_selected else "") + token
+                it = store.append([None, label, token, is_selected])
+                if is_selected:
+                    view.select_path(store.get_path(it))
+                jobs.append((idx, fileName, p - 1))
+                idx += 1
+
+        sw = Gtk.ScrolledWindow()
+        sw.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        sw.set_hexpand(True)
+        sw.set_vexpand(True)
+        sw.add(view)
+        dialog.get_content_area().add(sw)
+
+        self._chapter_dialog = dialog
+        self._chapter_store = store
+        self._chapter_view = view
+        self._chapter_base_pix = {}
+        self._chapter_stop = False
+
+        th = threading.Thread(target=self._chapter_render_worker, args=(jobs,))
+        th.daemon = True
+        th.start()
+
+        dialog.connect("response", self.on_chapter_dialog_response)
+        dialog.connect("delete-event", self.on_chapter_dialog_delete)
+        dialog.connect("destroy", self.on_chapter_dialog_destroy)
+        dialog.show_all()
+        dialog.run()
+
+
+    def on_chapter_view_click(self, view, event):
+        """Toggle the clicked page instead of replacing the selection."""
+        if event.button == 1 and event.type == Gdk.EventType.BUTTON_PRESS:
+            try:
+                path = view.get_path_at_pos(int(event.x), int(event.y))
+            except Exception:
+                path = None
+            if path is not None and self._chapter_store is not None:
+                it = self._chapter_store.get_iter(path)
+                token = self._chapter_store.get_value(it, 2)
+                new_selected = not view.path_is_selected(path)
+                if new_selected:
+                    view.select_path(path)
+                else:
+                    view.unselect_path(path)
+                self._chapter_store.set_value(it, 1, ("[X] " if new_selected else "") + token)
+                self._chapter_store.set_value(it, 3, new_selected)
+                self._chapter_apply_thumb_selection(path.get_indices()[0], new_selected)
+                return True
+        return False
+
+    def _chapter_apply_thumb_selection(self, idx, is_selected):
+        """Show or hide the selection border on an already rendered thumbnail."""
+        try:
+            base = self._chapter_base_pix.get(idx)
+            it = self._chapter_store.get_iter_from_string(str(idx))
+            if base is None:
+                return
+            if is_selected:
+                self._chapter_store.set_value(it, 0, self._chapter_bordered_thumb(base))
+            else:
+                self._chapter_store.set_value(it, 0, base)
+        except Exception:
+            pass
+
+    @staticmethod
+    def _chapter_bordered_thumb(base):
+        """Return a copy of a thumbnail with a high-contrast selection border."""
+        w = base.get_width()
+        h = base.get_height()
+        b = max(4, min(10, min(w, h) // 12))
+        out = GdkPixbuf.Pixbuf.new(GdkPixbuf.Colorspace.RGB, True, 8, w, h)
+        out.fill(0xff0080ff)
+        iw = max(1, w - 2 * b)
+        ih = max(1, h - 2 * b)
+        base.copy_area(b, b, iw, ih, out, b, b)
+        return out
+
+
+    def _chapter_render_worker(self, jobs):
+        """Render all page thumbnails off the main thread (low resolution)."""
+        docs = {}
+        for idx, fileName, page_idx in jobs:
+            if self._chapter_stop:
+                break
+            try:
+                doc = docs.get(fileName)
+                if doc is None:
+                    doc = Poppler.Document.new_from_file("file://" + fileName, None)
+                    docs[fileName] = doc
+                page = doc.get_page(page_idx)
+                pw, ph = page.get_size()
+                scale = min(140.0 / pw, 190.0 / ph)
+                surface = cairo.ImageSurface(cairo.FORMAT_ARGB32,
+                                             max(1, int(pw * scale)), max(1, int(ph * scale)))
+                cr = cairo.Context(surface)
+                cr.set_source_rgb(1, 1, 1)
+                cr.paint()
+                cr.scale(scale, scale)
+                page.render(cr)
+                GLib.idle_add(self._chapter_set_thumb, idx, surface)
+            except Exception:
+                pass
+
+
+    def _chapter_set_thumb(self, idx, surface):
+        """Copy a rendered surface into the model (runs on the main thread)."""
+        if self._chapter_stop or self._chapter_store is None:
+            return False
+        try:
+            pix = Gdk.pixbuf_get_from_surface(surface, 0, 0,
+                                              surface.get_width(), surface.get_height())
+            it = self._chapter_store.get_iter_from_string(str(idx))
+            self._chapter_base_pix[idx] = pix
+            if self._chapter_store.get_value(it, 3):
+                pix = self._chapter_bordered_thumb(pix)
+            self._chapter_store.set_value(it, 0, pix)
+        except Exception:
+            pass
+        return False
+
+
+    def _chapter_collect(self):
+        """Read the currently selected pages back into the entry."""
+        tokens = []
+        try:
+            for row in self._chapter_store:
+                if row[3]:
+                    tokens.append(row[2])
+        except Exception:
+            return
+        tokens.sort(key=lambda t: (int(t.split(":")[0]), int(t.split(":")[1])))
+        self.arw["entry_chapters"].set_text(", ".join(tokens))
+
+
+    def on_chapter_dialog_response(self, dialog, response):
+        self._chapter_collect()
+        dialog.destroy()
+
+
+    def on_chapter_dialog_delete(self, dialog, event):
+        self._chapter_collect()
+        return False
+
+
+    def on_chapter_dialog_destroy(self, dialog):
+        self._chapter_stop = True
+        self._chapter_dialog = None
+        self._chapter_store = None
+        self._chapter_view = None
+        self._chapter_base_pix = {}
         self.previewUpdate()
 
 
@@ -2383,6 +2656,72 @@ class gtkGui(TxtOnly):
     def _________________________PREVIEW() :
         pass
 
+    def empty_preview_active(self):
+        try:
+            loaded_files = [filename for filename in inputFiles_a.values() if os.path.isfile(filename)]
+        except Exception:
+            loaded_files = []
+        return len(loaded_files) == 0
+
+    def fit_drop_text(self, cr, text, max_width, size):
+        cr.select_font_face("Georgia", 0, 1)
+        size = int(max(10, size))
+        cr.set_font_size(size)
+        __, __, text_width, __ = cr.text_extents(text)[:4]
+        if text_width > max_width > 0:
+            size = int(max(10, size * max_width / text_width))
+            cr.set_font_size(size)
+        return size
+
+    def draw_empty_drop(self, cr):
+        width = max(1, int(areaAllocationW_i))
+        height = max(1, int(areaAllocationH_i))
+        cr.set_source_rgb(0.95, 0.95, 0.95)
+        cr.rectangle(0, 0, width, height)
+        cr.fill()
+
+        pad = max(16, int(min(width, height) * 0.08))
+        box_w = max(280, min(width - 2 * pad, int(width * 0.62)))
+        box_h = max(190, min(height - 2 * pad, int(height * 0.50)))
+        x = int((width - box_w) / 2)
+        y = int((height - box_h) / 2)
+        self.drop_rect = (x, y, box_w, box_h)
+        self.drop_active = True
+
+        cr.set_source_rgb(1, 1, 1)
+        cr.rectangle(x, y, box_w, box_h)
+        cr.fill()
+
+        cr.save()
+        cr.set_source_rgb(0.62, 0.62, 0.62)
+        cr.set_line_width(max(1.5, min(3.0, width / 400.0)))
+        cr.set_dash((10, 8))
+        cr.rectangle(x, y, box_w, box_h)
+        cr.stroke()
+        cr.restore()
+
+        title = _("Drop a PDF here")
+        subtitle = _("or click to open one")
+        inner = max(12, int(min(box_w, box_h) * 0.08))
+        title_size = self.fit_drop_text(cr, title, box_w - 2 * inner, min(30, max(16, box_w / 18)))
+        subtitle_size = self.fit_drop_text(cr, subtitle, box_w - 2 * inner, min(20, max(12, box_w / 28)))
+
+        cr.set_font_size(title_size)
+        __, title_y, title_w, title_h = cr.text_extents(title)[:4]
+        cr.set_font_size(subtitle_size)
+        __, subtitle_y, subtitle_w, subtitle_h = cr.text_extents(subtitle)[:4]
+        gap = int(title_size * 0.55)
+        top = y + max(0, int((box_h - (title_h + gap + subtitle_h)) / 2))
+
+        cr.set_source_rgb(0.22, 0.22, 0.22)
+        cr.set_font_size(title_size)
+        cr.move_to(x + int((box_w - title_w) / 2), top - title_y)
+        cr.show_text(title)
+        cr.set_font_size(subtitle_size)
+        cr.move_to(x + int((box_w - subtitle_w) / 2), top + title_h + gap - subtitle_y)
+        cr.show_text(subtitle)
+        return True
+
     def OnDraw(self, area, cr):
         global page
         global areaAllocationW_i, areaAllocationH_i
@@ -2400,19 +2739,21 @@ class gtkGui(TxtOnly):
             areaAllocationW_i = self.area.get_allocated_width()
             areaAllocationH_i  = self.area.get_allocated_height()
 
+        self.drop_active = False
+        self.drop_rect = None
 
-        # If nothing has not yet been loaded, show nofile.pdf
         try :
             data1 = outputStream.getvalue()
         except Exception as _e:
-            f1 = open(sfp2("data/nofile.pdf"),"rb")
-            data1 = f1.read()
-            f1.close()
+            data1 = b""
 
 
         # TODO : When two calls are too close, it may create a strange stack resulting in an empty OutputStream
         #        This has to be redesigned.
         if len(data1) == 0 :
+            if self.empty_preview_active() :
+                self.draw_empty_drop(cr)
+                return False
             return
 
         # If the preview has not changed, don't render
@@ -2476,7 +2817,7 @@ class gtkGui(TxtOnly):
         Voffset_i = int((areaAllocationH_i - heightPoints)/2)
 
         # set background.
-        cr.set_source_rgb(0.7, 0.6, 0.5)
+        cr.set_source_rgb(0.95, 0.95, 0.95)
         cr.paint()
 
         # set page background
@@ -2789,6 +3130,11 @@ class gtkGui(TxtOnly):
                 Id = str(str(selected_page[5] + 1) + "," + str(humanReadableRow_i))
 
         elif event.type == Gdk.EventType.BUTTON_PRESS:
+            if self.empty_preview_active() :
+                if event.button == 1 :
+                    self.file_manager(None)
+                return
+
             # Both left and right clicks select the page under the cursor, so
             # that the context menu (right click) always acts on the clicked page.
             right_click_menu = (event.button == 3)

@@ -12,6 +12,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - Added "Delete this page" and "Insert blank page before" entries to the preview context menu.
 - Added a "Chapter starts (right page)" option: blank pages are inserted automatically so every listed chapter begins on an odd (recto) reading position.
 - Added a preview info box (file, source page, folded order, booklet) to help locate source pages and verify folding.
+- Added a startup PDF drop zone with click-to-open file selection.
+- Added a clickable chapter-start page selector with page thumbnails.
 
 ### Changed
 - Migrated core PDF processing engine from legacy `pypdf`/`pdfrw` to `pikepdf`, significantly improving rendering speed and memory utilization.
@@ -19,6 +21,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - Completely rewrote the page transformation matrix engine to enforce strict mathematical post-multiplication for reliable scaling, translation, and rotation handling.
 - Optimized the preview rendering pipeline by removing synchronous debugging loggers to improve scrolling and configuration responsiveness.
 - Right-clicking the preview now selects the page under the cursor before showing the context menu.
+- Replaced the startup welcome PDF with a lighter neutral-gray preview background.
+- Improved chapter-selector thumbnail loading, sizing, selection marking, and click targeting.
 
 ### Fixed
 - Resolved pervasive page centering regressions that occurred when combining page rotation, custom output scaling, and manual translations.
