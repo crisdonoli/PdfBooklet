@@ -1122,6 +1122,9 @@ class gtkGui(TxtOnly):
         self.ar_pages = []
         self.ar_layout = []
         self.previewPage = 0
+        self.ar_booklet_ranges = []
+        self.ar_booklet_reading = []
+        self.updating_booklet_selector = False
         self.clipboard= {}
         self.arranger_view = None
         self.imposition = []
@@ -1211,6 +1214,8 @@ class gtkGui(TxtOnly):
 
         self.area.show()
         self.pagesTr = {}
+        if "bookletBox" in self.arw :
+            self.arw["bookletBox"].hide()
 
 # ############ Setup drag motion for drawingarea1 ##############
 
@@ -2908,48 +2913,7 @@ class gtkGui(TxtOnly):
             current_pages = list(self.ar_pages.values())[0]
             pageRef_s = current_pages[i]
             file_number, page_number = pageRef_s.split(":")
-            is_blank = (page_number == "-1")
             page_number = int(page_number) + 1
-
-            # reading order (folding order) of this cell
-            order_list = getattr(self, "ar_order_list", [])
-            order_i = order_list[i] if i < len(order_list) else 0
-
-            # booklet (cahier) number of this cell
-            booklet_list = getattr(self, "ar_booklet_list", [])
-            booklet_i = booklet_list[i] if i < len(booklet_list) else 0
-
-            # draw the info box (file / source page / folded order / booklet)
-            if self.arw["hide_numbers"].get_active() == 0 :
-                cr.select_font_face("Georgia", 0, 1)
-                fontsize_i = max(7, int(columnWidth / 32))
-                cr.set_font_size(fontsize_i)
-
-                src_s = "-" if is_blank else str(page_number)
-                ord_s = str(order_i) if order_i != 0 else "-"
-                bklt_s = str(booklet_i) if booklet_i != 0 else "-"
-                lines = ["file: " + str(file_number),
-                         "source page: " + src_s,
-                         "folded order: " + ord_s,
-                         "booklet: " + bklt_s]
-
-                line_h = fontsize_i + 2
-                pad = max(2, int(fontsize_i / 2))
-                txtWidth = max(cr.text_extents(t)[2] for t in lines)
-                box_w = int(txtWidth) + 2 * pad
-                box_h = line_h * len(lines) + 2 * pad
-
-                # top left corner of the cell
-                box_x = previewColPos_a[a[1]] + pad
-                box_y = (previewRowPos_a[a[0]] - rowHeight) + pad
-
-                cr.set_source_rgba(1, 1, 1, 0.8)
-                cr.rectangle(box_x, box_y, box_w, box_h)
-                cr.fill()
-                cr.set_source_rgba(1, 0, 0, 0.9)
-                for idx, t in enumerate(lines) :
-                    cr.move_to(box_x + pad, box_y + pad + fontsize_i + idx * line_h)
-                    cr.show_text(t)
 
             pageId = str(a[0]) + ":" + str(a[1])
             pageContent_a[pageId] = [file_number, page_number]
@@ -3596,6 +3560,8 @@ class gtkGui(TxtOnly):
                     # reading-order index of each cell of the current sheet
                     self.ar_order_list = ar_order.get(previewPage, [])
                     self.ar_booklet_list = ar_booklet.get(previewPage, [])
+                    self.update_booklet_selector(previewPage, ar_cahiers)
+                    self.update_page_info(previewPage)
                     
                     if previewPage in _PREVIEW_BYTES_CACHE:
                         # Move to end of LRU
@@ -3721,12 +3687,154 @@ class gtkGui(TxtOnly):
             self.preview(self.previewPage)                # update the preview
 
 
+    def booklet_ranges(self, ar_cahiers) :
+        """Sheet ranges of each booklet: [(first, past_last), ...] using the
+        number of folios of every cahier (each folio = 2 sheets)."""
+        ranges = []
+        start = 0
+        try :
+            keys = sorted(ar_cahiers.keys())
+        except Exception :
+            return ranges
+        for k in keys :
+            try :
+                folios = int(ar_cahiers[k])
+            except Exception :
+                continue
+            if folios < 1 :
+                continue
+            end = start + folios * 2
+            ranges.append((start, end))
+            start = end
+        return ranges
+
+
+    def update_booklet_selector(self, previewPage, ar_cahiers) :
+        """Refresh the per-booklet selector: one entry per generated booklet
+        with its own sheets, so every booklet can be checked independently."""
+        ranges = self.booklet_ranges(ar_cahiers or {})
+        readings = []
+        for (start, end) in ranges :
+            vals = []
+            for s in range(start, end) :
+                vals += [o for o in ar_order.get(s, []) if o]
+            readings.append((min(vals), max(vals)) if vals else None)
+
+        combo = self.arw.get("bookletSelector", None)
+        info = self.arw.get("bookletInfo", None)
+        box = self.arw.get("bookletBox", None)
+        if combo is None :
+            return
+        self.ar_booklet_ranges = ranges
+        self.ar_booklet_reading = readings
+        if len(ranges) <= 1 :
+            if box is not None :
+                box.hide()
+            return
+        if box is not None :
+            box.show_all()
+
+        key = [(s, e) for (s, e) in ranges]
+        if getattr(self, "_booklet_combo_key", None) != key :
+            self.updating_booklet_selector = True
+            try :
+                combo.remove_all()
+                for i, (s, e) in enumerate(ranges) :
+                    combo.append_text(_("Booklet %d (sheets %d-%d)") % (i + 1, s + 1, e))
+            finally :
+                self.updating_booklet_selector = False
+            self._booklet_combo_key = key
+
+        k = 0
+        for i, (s, e) in enumerate(ranges) :
+            if s <= previewPage < e :
+                k = i
+                break
+        else :
+            k = len(ranges) - 1
+
+        self.updating_booklet_selector = True
+        try :
+            combo.set_active(k)
+        finally :
+            self.updating_booklet_selector = False
+
+        if info is not None :
+            s, e = ranges[k]
+            r = readings[k] if k < len(readings) else None
+            if r :
+                info.set_text(_("Booklet %d/%d - sheet %d/%d - reading %d-%d")
+                              % (k + 1, len(ranges), previewPage - s + 1, e - s, r[0], r[1]))
+            else :
+                info.set_text(_("Booklet %d/%d - sheet %d/%d")
+                              % (k + 1, len(ranges), previewPage - s + 1, e - s))
+
+
+    def update_page_info(self, previewPage) :
+        """Show the per-page info (file / source / folded order / booklet) as
+        a single row above the preview, outside the page, so it never covers
+        the PDF. Uses the theme font, like the side panel."""
+        box = self.arw.get("pageInfoBox", None)
+        label = self.arw.get("pageInfoLabel", None)
+        if box is None or label is None :
+            return
+        try :
+            hidden = self.arw["hide_numbers"].get_active()
+        except Exception :
+            hidden = False
+        parts = []
+        if not hidden :
+            try :
+                pages = list(self.ar_pages.values())[0]
+            except Exception :
+                pages = []
+            orders = getattr(self, "ar_order_list", [])
+            booklets = getattr(self, "ar_booklet_list", [])
+            for i, pageRef_s in enumerate(pages) :
+                try :
+                    file_number, page_number = pageRef_s.split(":")
+                except Exception :
+                    continue
+                src_s = "-" if page_number == "-1" else str(int(page_number) + 1)
+                order_i = orders[i] if i < len(orders) else 0
+                booklet_i = booklets[i] if i < len(booklets) else 0
+                parts.append(_("file: %s - source: %s - order: %s - booklet: %s")
+                             % (file_number, src_s,
+                                str(order_i) if order_i else "-",
+                                str(booklet_i) if booklet_i else "-"))
+        if parts :
+            label.set_text("   |   ".join(parts))
+            box.show()
+        else :
+            box.hide()
+
+
+    def on_booklet_selected(self, widget) :
+        """Jump to the first sheet of the selected booklet."""
+        if getattr(self, "updating_booklet_selector", False) :
+            return
+        try :
+            k = widget.get_active()
+        except Exception :
+            return
+        ranges = getattr(self, "ar_booklet_ranges", [])
+        if k is None or k < 0 or k >= len(ranges) :
+            return
+        start, end = ranges[k]
+        self.previewPage = start
+        self.arw["previewEntry"].set_text(str(start + 1))
+        if self.arw["automaticUpdate"].get_active() == 0 :
+            self.preview(self.previewPage)
+
+
     def previewUpdate(self, Event = None, mydata = None) :
 
         global inputFiles_a
 
         if len(inputFiles_a) == 0 :
             #showwarning(_("No file loaded"), _("Please select a file first"))
+            if "pageInfoBox" in self.arw :
+                self.arw["pageInfoBox"].hide()
             return False
         if Event != None :
             value_s = self.arw["entry11"].get_text()
