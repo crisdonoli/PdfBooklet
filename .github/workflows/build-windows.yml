@@ -16,7 +16,7 @@ jobs:
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          python-version: "3.12"
 
       - name: Setup MSYS2
         uses: msys2/setup-msys2@v2
@@ -35,6 +35,7 @@ jobs:
             mingw-w64-x86_64-python-lxml
             mingw-w64-x86_64-python-dateutil
             mingw-w64-x86_64-python-packaging
+            mingw-w64-x86_64-gcc
             mingw-w64-x86_64-cmake
             mingw-w64-x86_64-ninja
 
