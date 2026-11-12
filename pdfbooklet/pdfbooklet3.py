@@ -5096,7 +5096,7 @@ def main() :
         if os.path.isdir(cfg_path_u) == False :
             os.mkdir(cfg_path_u)
 
-        share_path_u = "/usr/share/pdfbooklet"
+        share_path_u = os.path.dirname(os.path.abspath(__file__))
         if os.path.isdir(share_path_u) == False :
             os.mkdir(share_path_u)
 

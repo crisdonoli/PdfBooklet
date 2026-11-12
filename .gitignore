@@ -32,3 +32,5 @@ __pycache__/
 /.tox/
 /unittests.xml
 /test_project_*/
+
+.codegraph
