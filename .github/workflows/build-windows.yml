@@ -30,6 +30,12 @@ jobs:
             mingw-w64-x86_64-python-gobject
             mingw-w64-x86_64-python-cairo
             mingw-w64-x86_64-python-pip
+            mingw-w64-x86_64-python-pikepdf
+            mingw-w64-x86_64-python-pillow
+            mingw-w64-x86_64-python-lxml
+            mingw-w64-x86_64-python-img2pdf
+            mingw-w64-x86_64-python-dateutil
+            mingw-w64-x86_64-python-packaging
             mingw-w64-x86_64-cmake
             mingw-w64-x86_64-ninja
 
@@ -37,7 +43,7 @@ jobs:
         shell: msys2 {0}
         run: |
           python -m pip install --upgrade pip --break-system-packages
-          pip install pikepdf img2pdf python-dateutil packaging pyinstaller --break-system-packages
+          pip install pyinstaller --break-system-packages
 
       - name: Build with PyInstaller
         shell: msys2 {0}
