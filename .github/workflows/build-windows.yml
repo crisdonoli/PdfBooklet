@@ -13,31 +13,26 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Setup Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-
-      - name: Setup MSYS2
+      - name: Setup MSYS2 (UCRT64)
         uses: msys2/setup-msys2@v2
         with:
-          msystem: MINGW64
+          msystem: UCRT64
           update: true
-          suppress-deprecation-warnings: msystem-mingw64
           install: >-
-            mingw-w64-x86_64-gtk3
-            mingw-w64-x86_64-poppler
-            mingw-w64-x86_64-gobject-introspection
-            mingw-w64-x86_64-python-gobject
-            mingw-w64-x86_64-python-cairo
-            mingw-w64-x86_64-python-pip
-            mingw-w64-x86_64-python-pillow
-            mingw-w64-x86_64-python-lxml
-            mingw-w64-x86_64-python-dateutil
-            mingw-w64-x86_64-python-packaging
-            mingw-w64-x86_64-gcc
-            mingw-w64-x86_64-cmake
-            mingw-w64-x86_64-ninja
+            mingw-w64-ucrt-x86_64-gtk3
+            mingw-w64-ucrt-x86_64-poppler
+            mingw-w64-ucrt-x86_64-gobject-introspection
+            mingw-w64-ucrt-x86_64-python-gobject
+            mingw-w64-ucrt-x86_64-python-cairo
+            mingw-w64-ucrt-x86_64-python-pip
+            mingw-w64-ucrt-x86_64-python-pillow
+            mingw-w64-ucrt-x86_64-python-lxml
+            mingw-w64-ucrt-x86_64-python-dateutil
+            mingw-w64-ucrt-x86_64-python-packaging
+            mingw-w64-ucrt-x86_64-cmake
+            mingw-w64-ucrt-x86_64-ninja
+            mingw-w64-ucrt-x86_64-gcc
+            mingw-w64-ucrt-x86_64-qpdf
 
       - name: Install Python deps
         shell: msys2 {0}
